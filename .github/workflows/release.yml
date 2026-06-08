@@ -13,6 +13,23 @@ env:
     python -c "import vapoursynth as vs; assert hasattr(vs.core, 'vnlb')"
 
 jobs:
+  validate-release-tag:
+    name: validate-release-tag
+    if: ${{ startsWith(github.ref, 'refs/tags/R') }}
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check release tag
+        run: python tools/version.py --check-release-tag "${GITHUB_REF_NAME}"
+
   build-wheels:
     name: wheels-${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
@@ -143,6 +160,7 @@ jobs:
   publish-pypi:
     name: publish-pypi
     needs:
+      - validate-release-tag
       - build-wheels
       - build-sdist
     if: ${{ startsWith(github.ref, 'refs/tags/R') }}
@@ -164,6 +182,7 @@ jobs:
   publish-github-release:
     name: publish-github-release
     needs:
+      - validate-release-tag
       - build-wheels
       - build-sdist
     if: ${{ startsWith(github.ref, 'refs/tags/R') }}

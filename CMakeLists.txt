@@ -1,8 +1,22 @@
 cmake_minimum_required(VERSION 3.24)
 
+function(vnlb_read_project_version out_var)
+  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/pyproject.toml" _VNLB_PYPROJECT)
+  string(REGEX MATCH "(^|\n)version[ \t]*=[ \t]*\"([0-9]+\\.[0-9]+\\.[0-9]+)\""
+    _VNLB_PROJECT_VERSION_MATCH
+    "${_VNLB_PYPROJECT}"
+  )
+  if(NOT _VNLB_PROJECT_VERSION_MATCH)
+    message(FATAL_ERROR "Could not read numeric [project].version from pyproject.toml")
+  endif()
+  set(${out_var} "${CMAKE_MATCH_2}" PARENT_SCOPE)
+endfunction()
+
+vnlb_read_project_version(VNLB_PROJECT_VERSION)
+
 project(
   VapourSynthVNLB
-  VERSION 0.1.0
+  VERSION "${VNLB_PROJECT_VERSION}"
   DESCRIPTION "Video Non-Local Bayes denoising plugin for VapourSynth"
   LANGUAGES CXX
 )
@@ -10,6 +24,12 @@ project(
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vnlb_version.hpp.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/vnlb_version.hpp"
+  @ONLY
+)
 
 option(VNLB_BUILD_PLUGIN "Build the VapourSynth native plugin target" OFF)
 option(VNLB_ENABLE_TESTS "Enable project tests" ON)
@@ -152,6 +172,10 @@ if(VNLB_BUILD_PLUGIN)
     PRIVATE
       vnlb_core
       VapourSynth::VapourSynth
+  )
+  target_include_directories(vnlb
+    PRIVATE
+      "${CMAKE_CURRENT_BINARY_DIR}/generated"
   )
   set_target_properties(vnlb PROPERTIES
     CXX_EXTENSIONS OFF

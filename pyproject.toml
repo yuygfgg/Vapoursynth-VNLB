@@ -39,6 +39,7 @@ include = [
   "/packaging",
   "/pyproject.toml",
   "/src",
+  "/tools/version.py",
 ]
 
 [tool.hatch.build.targets.wheel]

@@ -1,6 +1,7 @@
 #include "aggregate/aggregate.hpp"
 #include "core/core.hpp"
 #include "flow/flow.hpp"
+#include "vnlb_version.hpp"
 
 #include <VSHelper4.h>
 #include <VapourSynth4.h>
@@ -906,8 +907,9 @@ void VS_CC FinalCreate(const VSMap* in, VSMap* out,
 VS_EXTERNAL_API(void)
 VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
     vspapi->configPlugin(kPluginId, kPluginNamespace, "VapourSynth VNLB",
-                         VS_MAKE_VERSION(0, 2), VAPOURSYNTH_API_VERSION, 0,
-                         plugin);
+                         VS_MAKE_VERSION(VNLB_VERSION_MAJOR,
+                                         VNLB_VERSION_MINOR),
+                         VAPOURSYNTH_API_VERSION, 0, plugin);
 
     constexpr const char* stage_args =
         "clip:vnode;sigma:float;block_size:int:opt;block_step:int:opt;"
