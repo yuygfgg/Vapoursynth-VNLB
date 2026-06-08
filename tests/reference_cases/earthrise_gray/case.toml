@@ -1,0 +1,78 @@
+          name = "earthrise_gray"
+          source = "NASA Apollo 8 Earthrise image via Wikimedia Commons public-domain file redirect"
+          format = "Gray float32 PFM reference I/O, stored as float32 [0, 1]"
+          width = 48
+          height = 48
+          frames = 5
+
+          [noise]
+          sigma_8bit = 12
+          seed = 3825046580
+
+          [vnlb]
+          block_size = 4
+          patch_time = 2
+          bm_range = 3
+          radius = 6
+          group_size = 40
+          rank = 16
+          beta = 3
+          basic_variance_threshold = 1.1
+          final_variance_threshold = 1.86667
+          final_tau_8bit = 400
+
+          [reference]
+          implementation = "pariasm/vnlb"
+          commit = "3461d9d3b8d31baa0eb35e5acc60bedd283f1dd3"
+          local_patch = "third_party/reference/patches/pariasm-vnlb-macos-build.patch"
+          binary = "third_party/reference/build/pariasm-vnlb/bin/vnlbayes"
+          command = [
+            "/Users/a1/Vapoursynth-VNLB/third_party/reference/build/pariasm-vnlb/bin/vnlbayes",
+"-i",
+"/Users/a1/Vapoursynth-VNLB/tests/reference_cases/earthrise_gray/_reference_work/input/frame_%03d.pfm",
+"-f",
+"0",
+"-l",
+"4",
+"-sigma",
+"12",
+"-px1",
+"4",
+"-pt1",
+"2",
+"-px2",
+"4",
+"-pt2",
+"2",
+"-wx1",
+"7",
+"-wx2",
+"7",
+"-wt1",
+"6",
+"-wt2",
+"6",
+"-np1",
+"40",
+"-np2",
+"40",
+"-r1",
+"16",
+"-r2",
+"16",
+"-b1",
+"3",
+"-b2",
+"3",
+"-verbose",
+"false",
+"-bsic",
+"/Users/a1/Vapoursynth-VNLB/tests/reference_cases/earthrise_gray/_reference_work/basic/frame_%03d.pfm",
+"-deno",
+"/Users/a1/Vapoursynth-VNLB/tests/reference_cases/earthrise_gray/_reference_work/final/frame_%03d.pfm"
+          ]
+
+          [tolerance]
+          max_abs = 0.15
+          mean_abs = 0.004
+          rmse = 0.006

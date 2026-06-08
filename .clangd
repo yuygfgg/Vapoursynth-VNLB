@@ -1,0 +1,18 @@
+CompileFlags:
+  Add:
+    - -std=c++23
+    - -Wall
+    - -Wextra
+    - -Wpedantic
+
+Index:
+  Background: Build
+
+Completion:
+  AllScopes: true
+
+---
+If:
+  PathMatch: (src|tests)/.*
+CompileFlags:
+  CompilationDatabase: build/release

@@ -1,0 +1,7 @@
+build
+hatchling
+packaging
+numpy
+Pillow
+imageio
+pytest

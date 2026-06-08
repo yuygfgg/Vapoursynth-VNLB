@@ -1,0 +1,99 @@
+diff --git a/lib/iio/CMakeLists.txt b/lib/iio/CMakeLists.txt
+index 1598f94..179d3eb 100644
+--- a/lib/iio/CMakeLists.txt
++++ b/lib/iio/CMakeLists.txt
+@@ -33,18 +33,26 @@ find_package(TIFF REQUIRED)
+ find_package(JPEG REQUIRED)
+ find_package(PNG  REQUIRED)
+ 
+-#include_directories(PUBLIC ${TIFF_INCLUDE_DIR}
+-#                    PUBLIC ${JPEG_INCLUDE_DIR}
+-#                    PUBLIC ${PNG_INCLUDE_DIRS}
+-#                    PUBLIC ${FFTW_INCLUDES})
+-
+ add_library(iio STATIC iio.c)
+ 
+-target_link_libraries(iio png tiff jpeg)
++target_include_directories(iio PRIVATE
++    ${TIFF_INCLUDE_DIR}
++    ${TIFF_INCLUDE_DIRS}
++    ${JPEG_INCLUDE_DIR}
++    ${JPEG_INCLUDE_DIRS}
++    ${PNG_INCLUDE_DIR}
++    ${PNG_INCLUDE_DIRS})
++
++target_link_libraries(iio
++    ${PNG_LIBRARY}
++    ${PNG_LIBRARIES}
++    ${TIFF_LIBRARY}
++    ${TIFF_LIBRARIES}
++    ${JPEG_LIBRARY}
++    ${JPEG_LIBRARIES})
+ 
+ ###############################################################################
+ 
+ # Expose public includes to other subprojects through cache variable
+ set(IIO_INCLUDE_DIR ${PROJECT_SOURCE_DIR}
+     CACHE INTERNAL "${PROJECT_NAME}: Include Directories" FORCE)
+-
+diff --git a/lib/iio/iio.c b/lib/iio/iio.c
+index ebc54f9..ba21bf6 100644
+--- a/lib/iio/iio.c
++++ b/lib/iio/iio.c
+@@ -448,13 +448,13 @@ int iio_type_id(size_t sample_size, bool ieeefp_sample, bool signed_sample)
+ {
+ 	if (ieeefp_sample) {
+ 		if (signed_sample) fail("signed floats are a no-no!");
+-		switch(sample_size) {
+-		case sizeof(float):       return IIO_TYPE_FLOAT;
+-		case sizeof(double):      return IIO_TYPE_DOUBLE;
+-		case sizeof(long double): return IIO_TYPE_LONGDOUBLE;
+-		case sizeof(float)/2:     return IIO_TYPE_HALF;
+-		default: fail("bad float size %zu", sample_size);
+-		}
++		if (sample_size == sizeof(float)) return IIO_TYPE_FLOAT;
++		if (sample_size == sizeof(double)) return IIO_TYPE_DOUBLE;
++		if (sizeof(long double) != sizeof(double) &&
++		    sample_size == sizeof(long double))
++			return IIO_TYPE_LONGDOUBLE;
++		if (sample_size == sizeof(float)/2) return IIO_TYPE_HALF;
++		fail("bad float size %zu", sample_size);
+ 	} else {
+ 		switch(sample_size) {
+ 		case 1: return signed_sample ? IIO_TYPE_INT8 : IIO_TYPE_UINT8;
+diff --git a/src/VNLBayes/CMakeLists.txt b/src/VNLBayes/CMakeLists.txt
+index 3a06aa2..82688a8 100644
+--- a/src/VNLBayes/CMakeLists.txt
++++ b/src/VNLBayes/CMakeLists.txt
+@@ -1,4 +1,15 @@
+ set(LIBRARY_OUTPUT_PATH ${CMAKE_BINARY_DIR}/lib)
+ add_library(vnlb SHARED VideoNLBayes.cpp LibMatrix.cpp)
+-target_link_libraries(vnlb vidutils)
++target_include_directories(vnlb PRIVATE
++    ${CBLAS_INCLUDES}
++    ${CBLAS_INCLUDE_DIR}
++    ${CBLAS_INCLUDE_DIRS}
++    ${LAPACK_INCLUDES}
++    ${LAPACK_INCLUDE_DIR}
++    ${LAPACKE_INCLUDES})
++target_link_libraries(vnlb
++    vidutils
++    ${CBLAS_LIBRARIES}
++    ${LAPACK_LIBRARIES}
++    ${BLAS_LIBRARIES})
+ install(TARGETS vnlb LIBRARY DESTINATION lib COMPONENT libs)
+diff --git a/src/VNLBayes/LibMatrix.cpp b/src/VNLBayes/LibMatrix.cpp
+index d03a4f2..9a8d84d 100644
+--- a/src/VNLBayes/LibMatrix.cpp
++++ b/src/VNLBayes/LibMatrix.cpp
+@@ -24,10 +24,8 @@
+ #include <cstdlib>
+ #include <cstdio>
+ 
+-extern "C" {
+ #include <cblas.h>
+ #include <lapacke.h>
+-}
+ 
+ using namespace std;
+ 

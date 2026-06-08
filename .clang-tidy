@@ -1,0 +1,12 @@
+Checks: >
+  bugprone-*,
+  clang-analyzer-*,
+  cppcoreguidelines-*,
+  modernize-*,
+  performance-*,
+  readability-*
+WarningsAsErrors: ''
+HeaderFilterRegex: '^(src|include)/'
+CheckOptions:
+  - key: readability-identifier-length.IgnoredVariableNames
+    value: 'i|j|k|x|y|t|w|h'

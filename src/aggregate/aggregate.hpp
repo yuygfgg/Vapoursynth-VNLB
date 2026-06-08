@@ -1,0 +1,254 @@
+#pragma once
+
+#include "common/validation.hpp"
+#include "core/video.hpp"
+
+#include <cstddef>
+#include <span>
+#include <vector>
+
+namespace vnlb::aggregate {
+
+struct ContributionPlaneView {
+    float* data = nullptr;
+    int stride = 0;
+};
+
+struct ContributionLayout {
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    int search_bwd = 0;
+    int search_fwd = 0;
+    int patch_time = 0;
+    int slot_count = 0;
+
+    [[nodiscard]] int plane_pixels() const noexcept { return width * height; }
+    [[nodiscard]] int slot_stride() const noexcept {
+        return (channels + 1) * plane_pixels();
+    }
+    [[nodiscard]] int weight_plane_offset(int slot) const noexcept {
+        return (slot * slot_stride()) + (channels * plane_pixels());
+    }
+    [[nodiscard]] int numerator_plane_offset(int slot,
+                                             int channel) const noexcept {
+        return (slot * slot_stride()) + (channel * plane_pixels());
+    }
+    [[nodiscard]] int slot_for_output_offset(int output_offset) const noexcept {
+        return output_offset + search_bwd;
+    }
+    [[nodiscard]] bool
+    contains_output_offset(int output_offset) const noexcept {
+        const int slot = slot_for_output_offset(output_offset);
+        return slot >= 0 && slot < slot_count;
+    }
+    [[nodiscard]] std::size_t value_count() const noexcept {
+        return static_cast<std::size_t>(slot_count) *
+               static_cast<std::size_t>(slot_stride());
+    }
+};
+
+[[nodiscard]] ContributionLayout
+make_contribution_layout(core::VideoGeometry geometry, int search_bwd,
+                         int search_fwd, int patch_time);
+
+class ConstContributionStackView {
+  public:
+    constexpr ConstContributionStackView() noexcept = default;
+    constexpr ConstContributionStackView(const float* data,
+                                         ContributionLayout layout) noexcept
+        : data_(data), layout_(layout) {}
+    constexpr ConstContributionStackView(
+        std::span<const ContributionPlaneView> planes,
+        ContributionLayout layout) noexcept
+        : planes_(planes.data()), layout_(layout) {}
+
+    [[nodiscard]] constexpr const float* data() const noexcept { return data_; }
+    [[nodiscard]] constexpr bool has_storage() const noexcept {
+        return data_ != nullptr || planes_ != nullptr;
+    }
+    [[nodiscard]] constexpr ContributionLayout layout() const noexcept {
+        return layout_;
+    }
+
+    [[nodiscard]] float numerator(int slot, int channel, int x,
+                                  int y) const noexcept {
+        if (planes_ != nullptr) {
+            const auto plane = planes_[channel];
+            return plane
+                .data[(((slot * 2 * layout_.height) + y) * plane.stride) + x];
+        }
+        const int plane = layout_.numerator_plane_offset(slot, channel);
+        return data_[plane + (y * layout_.width) + x];
+    }
+
+    [[nodiscard]] float weight(int slot, int x, int y) const noexcept {
+        if (planes_ != nullptr) {
+            const auto plane = planes_[0];
+            return plane
+                .data[(((slot * 2 * layout_.height) + layout_.height + y) *
+                       plane.stride) +
+                      x];
+        }
+        const int plane = layout_.weight_plane_offset(slot);
+        return data_[plane + (y * layout_.width) + x];
+    }
+
+  private:
+    const float* data_ = nullptr;
+    const ContributionPlaneView* planes_ = nullptr;
+    ContributionLayout layout_{};
+};
+
+class ContributionStackView {
+  public:
+    constexpr ContributionStackView() noexcept = default;
+    constexpr ContributionStackView(float* data,
+                                    ContributionLayout layout) noexcept
+        : data_(data), layout_(layout) {}
+    constexpr ContributionStackView(std::span<ContributionPlaneView> planes,
+                                    ContributionLayout layout) noexcept
+        : planes_(planes.data()), layout_(layout) {}
+
+    [[nodiscard]] constexpr float* data() const noexcept { return data_; }
+    [[nodiscard]] constexpr bool has_storage() const noexcept {
+        return data_ != nullptr || planes_ != nullptr;
+    }
+    [[nodiscard]] constexpr ContributionLayout layout() const noexcept {
+        return layout_;
+    }
+    [[nodiscard]] constexpr bool has_plane_storage() const noexcept {
+        return planes_ != nullptr;
+    }
+
+    [[nodiscard]] float& numerator(int slot, int channel, int x,
+                                   int y) const noexcept {
+        if (planes_ != nullptr) {
+            const auto plane = planes_[channel];
+            return plane
+                .data[(((slot * 2 * layout_.height) + y) * plane.stride) + x];
+        }
+        const int plane = layout_.numerator_plane_offset(slot, channel);
+        return data_[plane + (y * layout_.width) + x];
+    }
+
+    [[nodiscard]] float& weight(int slot, int x, int y) const noexcept {
+        if (planes_ != nullptr) {
+            const auto plane = planes_[0];
+            return plane
+                .data[(((slot * 2 * layout_.height) + layout_.height + y) *
+                       plane.stride) +
+                      x];
+        }
+        const int plane = layout_.weight_plane_offset(slot);
+        return data_[plane + (y * layout_.width) + x];
+    }
+
+    [[nodiscard]] float& channel_weight(int slot, int channel, int x,
+                                        int y) const noexcept {
+        if (planes_ != nullptr) {
+            const auto plane = planes_[channel];
+            return plane
+                .data[(((slot * 2 * layout_.height) + layout_.height + y) *
+                       plane.stride) +
+                      x];
+        }
+        return weight(slot, x, y);
+    }
+
+    [[nodiscard]] float* numerator_row(int slot, int channel,
+                                       int y) const noexcept {
+        if (planes_ != nullptr) {
+            const auto plane = planes_[channel];
+            return plane.data +
+                   (((slot * 2 * layout_.height) + y) * plane.stride);
+        }
+        const int plane = layout_.numerator_plane_offset(slot, channel);
+        return data_ + plane + (y * layout_.width);
+    }
+
+    [[nodiscard]] float* weight_row(int slot, int y) const noexcept {
+        if (planes_ != nullptr) {
+            const auto plane = planes_[0];
+            return plane.data +
+                   (((slot * 2 * layout_.height) + layout_.height + y) *
+                    plane.stride);
+        }
+        const int plane = layout_.weight_plane_offset(slot);
+        return data_ + plane + (y * layout_.width);
+    }
+
+    [[nodiscard]] float* channel_weight_row(int slot, int channel,
+                                            int y) const noexcept {
+        if (planes_ != nullptr) {
+            const auto plane = planes_[channel];
+            return plane.data +
+                   (((slot * 2 * layout_.height) + layout_.height + y) *
+                    plane.stride);
+        }
+        return weight_row(slot, y);
+    }
+
+    void add_weight(int slot, int x, int y, float value) const noexcept {
+        if (planes_ != nullptr) {
+            for (int channel = 0; channel < layout_.channels; ++channel) {
+                channel_weight(slot, channel, x, y) += value;
+            }
+            return;
+        }
+        weight(slot, x, y) += value;
+    }
+
+    [[nodiscard]] ConstContributionStackView as_const() const noexcept {
+        if (planes_ != nullptr) {
+            return ConstContributionStackView(
+                std::span<const ContributionPlaneView>(
+                    planes_, static_cast<std::size_t>(layout_.channels)),
+                layout_);
+        }
+        return ConstContributionStackView(data_, layout_);
+    }
+
+  private:
+    float* data_ = nullptr;
+    ContributionPlaneView* planes_ = nullptr;
+    ContributionLayout layout_{};
+};
+
+class ContributionStack {
+  public:
+    ContributionStack() = default;
+    explicit ContributionStack(ContributionLayout layout) { resize(layout); }
+
+    void resize(ContributionLayout layout);
+    void clear();
+
+    [[nodiscard]] ContributionLayout layout() const noexcept { return layout_; }
+    [[nodiscard]] std::span<float> values() noexcept { return storage_; }
+    [[nodiscard]] std::span<const float> values() const noexcept {
+        return storage_;
+    }
+    [[nodiscard]] ContributionStackView view() noexcept {
+        return ContributionStackView(storage_.data(), layout_);
+    }
+    [[nodiscard]] ConstContributionStackView view() const noexcept {
+        return ConstContributionStackView(storage_.data(), layout_);
+    }
+    [[nodiscard]] ConstContributionStackView cview() const noexcept {
+        return ConstContributionStackView(storage_.data(), layout_);
+    }
+
+  private:
+    ContributionLayout layout_{};
+    std::vector<float> storage_;
+};
+
+void clear_contributions(ContributionStackView stack)
+    VNLB_INTERNAL_VALIDATION_NOEXCEPT;
+
+void aggregate_frame(std::span<const ConstContributionStackView> stacks,
+                     std::span<const int> anchor_frames, int output_frame,
+                     core::ConstVideoView source,
+                     core::MutableVideoView output);
+
+} // namespace vnlb::aggregate

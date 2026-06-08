@@ -1,0 +1,185 @@
+name: release
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CIBW_PROJECT_REQUIRES_PYTHON: ">=3.12"
+  CIBW_BUILD_VERBOSITY: "1"
+  CIBW_TEST_COMMAND: >-
+    vapoursynth config &&
+    python -c "import vapoursynth as vs; assert hasattr(vs.core, 'vnlb')"
+
+jobs:
+  build-wheels:
+    name: wheels-${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            runner: windows-2022
+            builder: direct
+            wheel_path: dist/*.whl
+            build_environment: >-
+              CC=gcc
+              CXX=g++
+              CMAKE_GENERATOR=Ninja
+              CMAKE_ARGS=-DVNLB_ENABLE_MARCH_NATIVE=OFF
+          - name: linux-x64
+            runner: ubuntu-24.04
+            builder: cibuildwheel
+            wheel_path: wheelhouse/*.whl
+            cibw_build: cp312-manylinux_x86_64
+            cibw_archs: x86_64
+            cibw_environment: >-
+              CMAKE_ARGS="-DVNLB_ENABLE_MARCH_NATIVE=OFF"
+          - name: linux-x64-musl
+            runner: ubuntu-24.04
+            builder: cibuildwheel
+            wheel_path: wheelhouse/*.whl
+            cibw_build: cp312-musllinux_x86_64
+            cibw_archs: x86_64
+            cibw_environment: >-
+              CMAKE_ARGS="-DVNLB_ENABLE_MARCH_NATIVE=OFF"
+          - name: macos-x64
+            runner: macos-26-intel
+            builder: direct
+            wheel_path: dist/*.whl
+            build_environment: >-
+              MACOSX_DEPLOYMENT_TARGET=12.0
+              CMAKE_OSX_ARCHITECTURES=x86_64
+              CMAKE_ARGS=-DVNLB_ENABLE_MARCH_NATIVE=OFF
+          - name: macos-arm64
+            runner: macos-26
+            builder: direct
+            wheel_path: dist/*.whl
+            build_environment: >-
+              MACOSX_DEPLOYMENT_TARGET=12.0
+              CMAKE_OSX_ARCHITECTURES=arm64
+              CMAKE_ARGS=-DVNLB_ENABLE_MARCH_NATIVE=OFF
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+
+      - name: Add MSYS2 to PATH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: echo "C:\msys64\mingw64\bin" >> $env:GITHUB_PATH
+
+      - name: Setup Python
+        if: matrix.builder == 'direct'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel directly
+        if: matrix.builder == 'direct'
+        env:
+          BUILD_ENVIRONMENT: ${{ matrix.build_environment }}
+        shell: bash
+        run: |
+          python -m pip install -U build
+          export ${BUILD_ENVIRONMENT}
+          python -m build --wheel
+
+      - name: Build wheel with cibuildwheel
+        if: matrix.builder == 'cibuildwheel'
+        uses: pypa/cibuildwheel@v3.4.1
+        env:
+          CIBW_BUILD: ${{ matrix.cibw_build }}
+          CIBW_ARCHS: ${{ matrix.cibw_archs }}
+          CIBW_ENVIRONMENT: ${{ matrix.cibw_environment }}
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.name }}
+          path: ${{ matrix.wheel_path }}
+          if-no-files-found: error
+
+  build-sdist:
+    name: sdist
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist
+        run: |
+          python -m pip install -U build
+          python -m build --sdist
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish-pypi:
+    name: publish-pypi
+    needs:
+      - build-wheels
+      - build-sdist
+    if: ${{ startsWith(github.ref, 'refs/tags/R') }}
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.14.0
+
+  publish-github-release:
+    name: publish-github-release
+    needs:
+      - build-wheels
+      - build-sdist
+    if: ${{ startsWith(github.ref, 'refs/tags/R') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
