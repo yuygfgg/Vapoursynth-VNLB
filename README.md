@@ -132,9 +132,6 @@ vnlb.Aggregate(clip clip, clip src[, int patch_time=1, int radius=1, int search_
 import vapoursynth as vs
 
 core = vs.core
-core.std.LoadPlugin(path="build/release/libvnlb.dylib")
-
-src = core.resize.Bicubic(src, format=vs.GRAYS)
 
 params = dict(
     sigma=5.1,
