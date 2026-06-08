@@ -906,7 +906,7 @@ void VS_CC FinalCreate(const VSMap* in, VSMap* out,
 VS_EXTERNAL_API(void)
 VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
     vspapi->configPlugin(kPluginId, kPluginNamespace, "VapourSynth VNLB",
-                         VS_MAKE_VERSION(0, 1), VAPOURSYNTH_API_VERSION, 0,
+                         VS_MAKE_VERSION(0, 2), VAPOURSYNTH_API_VERSION, 0,
                          plugin);
 
     constexpr const char* stage_args =
