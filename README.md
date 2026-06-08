@@ -13,13 +13,10 @@ Supported input formats:
 - `GrayS`
 - `YUV444PS`
 
-## Build
+## Installation
 
-Configure and build the release plugin:
-
-```bash
-cmake --preset release
-cmake --build --preset release
+```
+pip install -U vapoursynth-vnlb
 ```
 
 ## Usage
@@ -249,6 +246,15 @@ basic_stack = core.vnlb.Basic(
 ```
 
 If `_SceneChangePrev` or `Scenechange` is set, `mvfw` for that frame is ignored. If `_SceneChangeNext` is set, `mvbw` for that frame is ignored.
+
+## Build
+
+Configure and build the release plugin:
+
+```bash
+cmake --preset release
+cmake --build --preset release
+```
 
 ## Tests
 
