@@ -1,5 +1,6 @@
 #include "core.hpp"
 
+#include "common/compiler.hpp"
 #include "common/validation.hpp"
 #include "distance.hpp"
 #include "linalg/kernels.hpp"
@@ -50,18 +51,13 @@ void require(bool condition, const char* message) {
     return (((t * patch_size) + y) * patch_size) + x;
 }
 
-void copy_float_row(const float* source, float* destination,
-                    int count) noexcept {
-    int index = 0;
-    for (; index + 4 <= count; index += 4) {
-        destination[index] = source[index];
-        destination[index + 1] = source[index + 1];
-        destination[index + 2] = source[index + 2];
-        destination[index + 3] = source[index + 3];
+void copy_float_row(const float* VNLB_RESTRICT source,
+                    float* VNLB_RESTRICT destination, int count) noexcept {
+    if (count <= 0) {
+        return;
     }
-    for (; index < count; ++index) {
-        destination[index] = source[index];
-    }
+    linalg::kernels::copy_contiguous(source, destination,
+                                     static_cast<std::size_t>(count));
 }
 
 [[nodiscard]] bool group_is_equal(const std::vector<float>& group, int channels,
@@ -1044,8 +1040,54 @@ void gather_basic_group(ConstVideoView noisy, StageWorkspace& workspace,
     }
 }
 
+void gather_basic_samples_coupled_planes(
+    VideoGeometry geometry, const ConstPlaneView* VNLB_RESTRICT planes,
+    StageWorkspace& workspace, int similar) {
+    const int channels = geometry.channels;
+    const int patch_size = workspace.parameters_.patch_size;
+    const int patch_dim = workspace.patch_dim_;
+    const int sample_dim = channels * patch_dim;
+    workspace.samples_noisy_.resize(static_cast<std::size_t>(similar),
+                                    static_cast<std::size_t>(sample_dim));
+
+    for (int patch = 0; patch < similar; ++patch) {
+        const PatchMatch match =
+            workspace.matches_[static_cast<std::size_t>(patch)];
+        float* row =
+            workspace.samples_noisy_.row_data(static_cast<std::size_t>(patch));
+        for (int channel = 0; channel < channels; ++channel) {
+            const int channel_base = channel * patch_dim;
+            for (int frame_delta = 0;
+                 frame_delta < workspace.parameters_.patch_time;
+                 ++frame_delta) {
+                const int local_frame =
+                    geometry.local_frame(match.frame + frame_delta);
+                const ConstPlaneView plane =
+                    planes[(local_frame * channels) + channel];
+                for (int y = 0; y < patch_size; ++y) {
+                    const int position =
+                        patch_position(patch_size, 0, y, frame_delta);
+                    const float* input_row =
+                        plane.data +
+                        (static_cast<std::ptrdiff_t>(match.y + y) *
+                         plane.stride) +
+                        match.x;
+                    copy_float_row(input_row, row + channel_base + position,
+                                   patch_size);
+                }
+            }
+        }
+    }
+}
+
 void gather_basic_samples_coupled(ConstVideoView noisy,
                                   StageWorkspace& workspace, int similar) {
+    if (const ConstPlaneView* planes = noisy.planes(); planes != nullptr) {
+        gather_basic_samples_coupled_planes(noisy.geometry(), planes,
+                                            workspace, similar);
+        return;
+    }
+
     const VideoGeometry geometry = noisy.geometry();
     const int channels = geometry.channels;
     const int patch_size = workspace.parameters_.patch_size;
@@ -1114,8 +1156,73 @@ void gather_final_group(ConstVideoView noisy, ConstVideoView basic,
     }
 }
 
+void gather_final_samples_coupled_planes(
+    VideoGeometry geometry, const ConstPlaneView* VNLB_RESTRICT noisy_planes,
+    const ConstPlaneView* VNLB_RESTRICT basic_planes, StageWorkspace& workspace,
+    int similar) {
+    const int channels = geometry.channels;
+    const int patch_size = workspace.parameters_.patch_size;
+    const int patch_dim = workspace.patch_dim_;
+    const int sample_dim = channels * patch_dim;
+    workspace.samples_noisy_.resize(static_cast<std::size_t>(similar),
+                                    static_cast<std::size_t>(sample_dim));
+    workspace.samples_basic_.resize(static_cast<std::size_t>(similar),
+                                    static_cast<std::size_t>(sample_dim));
+
+    for (int patch = 0; patch < similar; ++patch) {
+        const PatchMatch match =
+            workspace.matches_[static_cast<std::size_t>(patch)];
+        float* noisy_row =
+            workspace.samples_noisy_.row_data(static_cast<std::size_t>(patch));
+        float* basic_row =
+            workspace.samples_basic_.row_data(static_cast<std::size_t>(patch));
+        for (int channel = 0; channel < channels; ++channel) {
+            const int channel_base = channel * patch_dim;
+            for (int frame_delta = 0;
+                 frame_delta < workspace.parameters_.patch_time;
+                 ++frame_delta) {
+                const int local_frame =
+                    geometry.local_frame(match.frame + frame_delta);
+                const int plane_index = (local_frame * channels) + channel;
+                const ConstPlaneView noisy_plane = noisy_planes[plane_index];
+                const ConstPlaneView basic_plane = basic_planes[plane_index];
+                for (int y = 0; y < patch_size; ++y) {
+                    const int position =
+                        patch_position(patch_size, 0, y, frame_delta);
+                    const int sample_position = channel_base + position;
+                    const float* noisy_input_row =
+                        noisy_plane.data +
+                        (static_cast<std::ptrdiff_t>(match.y + y) *
+                         noisy_plane.stride) +
+                        match.x;
+                    const float* basic_input_row =
+                        basic_plane.data +
+                        (static_cast<std::ptrdiff_t>(match.y + y) *
+                         basic_plane.stride) +
+                        match.x;
+                    copy_float_row(noisy_input_row, noisy_row + sample_position,
+                                   patch_size);
+                    copy_float_row(basic_input_row, basic_row + sample_position,
+                                   patch_size);
+                }
+            }
+        }
+    }
+}
+
 void gather_final_samples_coupled(ConstVideoView noisy, ConstVideoView basic,
                                   StageWorkspace& workspace, int similar) {
+    if (const ConstPlaneView* noisy_planes = noisy.planes();
+        noisy_planes != nullptr) {
+        if (const ConstPlaneView* basic_planes = basic.planes();
+            basic_planes != nullptr) {
+            gather_final_samples_coupled_planes(
+                noisy.geometry(), noisy_planes, basic_planes, workspace,
+                similar);
+            return;
+        }
+    }
+
     const VideoGeometry geometry = noisy.geometry();
     const int channels = geometry.channels;
     const int patch_size = workspace.parameters_.patch_size;
@@ -1205,15 +1312,17 @@ void write_group_contributions(StageWorkspace& workspace, int anchor_frame,
     }
 }
 
-void write_sample_contributions_coupled(
+void write_sample_contributions_coupled_contiguous(
     StageWorkspace& workspace, int anchor_frame, int similar,
-    aggregate::ContributionStackView stack) {
-    const auto layout = stack.layout();
+    aggregate::ContributionLayout layout, float* VNLB_RESTRICT data) {
     const int channels = workspace.geometry_.channels;
     const int patch_size = workspace.parameters_.patch_size;
     const int patch_dim = workspace.patch_dim_;
     const linalg::Matrix<float>& samples = workspace.filtered_;
-    const bool per_channel_weight = stack.has_plane_storage();
+    const int plane_pixels = layout.plane_pixels();
+    const int slot_stride = layout.slot_stride();
+    const int weight_plane = channels * plane_pixels;
+    const auto count = static_cast<std::size_t>(patch_size);
 
     for (int patch = 0; patch < similar; ++patch) {
         const PatchMatch match =
@@ -1230,33 +1339,89 @@ void write_sample_contributions_coupled(
                 const int output_y = match.y + y;
                 const int position =
                     patch_position(patch_size, 0, y, frame_delta);
-                if (!per_channel_weight) {
-                    float* weight_row =
-                        stack.weight_row(slot, output_y) + match.x;
-                    for (int x = 0; x < patch_size; ++x) {
-                        weight_row[x] += 1.0F;
-                    }
-                }
+                const int row_offset = (output_y * layout.width) + match.x;
+                float* weight_row =
+                    data + (slot * slot_stride) + weight_plane + row_offset;
+                linalg::kernels::add_scalar_contiguous(weight_row, 1.0F,
+                                                       count);
 
                 for (int channel = 0; channel < channels; ++channel) {
                     const float* sample_row =
                         row + (channel * patch_dim) + position;
                     float* numerator_row =
-                        stack.numerator_row(slot, channel, output_y) + match.x;
-                    float* weight_row = per_channel_weight
-                                            ? stack.channel_weight_row(
-                                                  slot, channel, output_y) +
-                                                  match.x
-                                            : nullptr;
-                    for (int x = 0; x < patch_size; ++x) {
-                        numerator_row[x] += sample_row[x];
-                        if (per_channel_weight) {
-                            weight_row[x] += 1.0F;
-                        }
-                    }
+                        data + (slot * slot_stride) +
+                        (channel * plane_pixels) + row_offset;
+                    linalg::kernels::add_contiguous(numerator_row, sample_row,
+                                                   count);
                 }
             }
         }
+    }
+}
+
+void write_sample_contributions_coupled_planes(
+    StageWorkspace& workspace, int anchor_frame, int similar,
+    aggregate::ContributionLayout layout,
+    aggregate::ContributionPlaneView* VNLB_RESTRICT planes) {
+    const int channels = workspace.geometry_.channels;
+    const int patch_size = workspace.parameters_.patch_size;
+    const int patch_dim = workspace.patch_dim_;
+    const linalg::Matrix<float>& samples = workspace.filtered_;
+    const auto count = static_cast<std::size_t>(patch_size);
+
+    for (int patch = 0; patch < similar; ++patch) {
+        const PatchMatch match =
+            workspace.matches_[static_cast<std::size_t>(patch)];
+        const float* row = samples.row_data(static_cast<std::size_t>(patch));
+        for (int frame_delta = 0;
+             frame_delta < workspace.parameters_.patch_time; ++frame_delta) {
+            const int output_offset = match.frame + frame_delta - anchor_frame;
+            if (!layout.contains_output_offset(output_offset)) {
+                continue;
+            }
+            const int slot = layout.slot_for_output_offset(output_offset);
+            for (int y = 0; y < patch_size; ++y) {
+                const int output_y = match.y + y;
+                const int position =
+                    patch_position(patch_size, 0, y, frame_delta);
+                const int numerator_row = (slot * 2 * layout.height) + output_y;
+                const int weight_row = numerator_row + layout.height;
+
+                for (int channel = 0; channel < channels; ++channel) {
+                    const auto plane = planes[channel];
+                    const float* sample_row =
+                        row + (channel * patch_dim) + position;
+                    float* numerator =
+                        plane.data +
+                        (static_cast<std::ptrdiff_t>(numerator_row) *
+                         plane.stride) +
+                        match.x;
+                    float* weight =
+                        plane.data +
+                        (static_cast<std::ptrdiff_t>(weight_row) *
+                         plane.stride) +
+                        match.x;
+                    linalg::kernels::add_contiguous_and_scalar_contiguous(
+                        numerator, weight, sample_row, 1.0F, count);
+                }
+            }
+        }
+    }
+}
+
+void write_sample_contributions_coupled(
+    StageWorkspace& workspace, int anchor_frame, int similar,
+    aggregate::ContributionStackView stack) {
+    const auto layout = stack.layout();
+    if (aggregate::ContributionPlaneView* planes = stack.planes();
+        planes != nullptr) {
+        write_sample_contributions_coupled_planes(
+            workspace, anchor_frame, similar, layout, planes);
+        return;
+    }
+    if (float* data = stack.data(); data != nullptr) {
+        write_sample_contributions_coupled_contiguous(
+            workspace, anchor_frame, similar, layout, data);
     }
 }
 

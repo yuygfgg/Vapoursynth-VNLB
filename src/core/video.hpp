@@ -92,8 +92,14 @@ class ConstVideoView {
         : planes_(planes.data()), geometry_(geometry) {}
 
     [[nodiscard]] constexpr const float* data() const noexcept { return data_; }
+    [[nodiscard]] constexpr const ConstPlaneView* planes() const noexcept {
+        return planes_;
+    }
     [[nodiscard]] constexpr bool has_storage() const noexcept {
         return data_ != nullptr || planes_ != nullptr;
+    }
+    [[nodiscard]] constexpr bool has_plane_storage() const noexcept {
+        return planes_ != nullptr;
     }
     [[nodiscard]] constexpr VideoGeometry geometry() const noexcept {
         return geometry_;

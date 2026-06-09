@@ -1,5 +1,7 @@
 #pragma once
 
+#include "common/compiler.hpp"
+
 #include <hwy/highway.h>
 
 #include <concepts>
@@ -8,7 +10,8 @@
 namespace vnlb::linalg::kernels {
 
 template <std::floating_point T>
-[[nodiscard]] inline T dot_contiguous_highway(const T* left, const T* right,
+[[nodiscard]] inline T dot_contiguous_highway(const T* VNLB_RESTRICT left,
+                                              const T* VNLB_RESTRICT right,
                                               std::size_t count) noexcept {
     namespace hn = hwy::HWY_NAMESPACE;
     const hn::ScalableTag<T> d;
@@ -52,8 +55,9 @@ template <std::floating_point T>
 }
 
 template <std::floating_point T>
-[[nodiscard]] inline T dot_centered_rows_highway(const T* left, const T* right,
-                                                 const T* mean,
+[[nodiscard]] inline T dot_centered_rows_highway(const T* VNLB_RESTRICT left,
+                                                 const T* VNLB_RESTRICT right,
+                                                 const T* VNLB_RESTRICT mean,
                                                  std::size_t count) noexcept {
     namespace hn = hwy::HWY_NAMESPACE;
     const hn::ScalableTag<T> d;
@@ -124,8 +128,9 @@ template <std::floating_point T>
 }
 
 template <std::floating_point T>
-inline void center_row_highway(const T* input, const T* mean, T* output,
-                               std::size_t count) noexcept {
+inline void
+center_row_highway(const T* VNLB_RESTRICT input, const T* VNLB_RESTRICT mean,
+                   T* VNLB_RESTRICT output, std::size_t count) noexcept {
     namespace hn = hwy::HWY_NAMESPACE;
     const hn::ScalableTag<T> d;
     const std::size_t lanes = hn::Lanes(d);
@@ -167,7 +172,43 @@ inline void center_row_highway(const T* input, const T* mean, T* output,
 }
 
 template <std::floating_point T>
-inline void add_contiguous_highway(T* output, const T* input,
+inline void copy_contiguous_highway(const T* VNLB_RESTRICT input,
+                                    T* VNLB_RESTRICT output,
+                                    std::size_t count) noexcept {
+    namespace hn = hwy::HWY_NAMESPACE;
+    const hn::ScalableTag<T> d;
+    const std::size_t lanes = hn::Lanes(d);
+
+    std::size_t index = 0;
+    if (count == lanes) {
+        hn::StoreU(hn::LoadU(d, input), d, output);
+        return;
+    }
+    if (count == (2 * lanes)) {
+        hn::StoreU(hn::LoadU(d, input), d, output);
+        hn::StoreU(hn::LoadU(d, input + lanes), d, output + lanes);
+        return;
+    }
+    for (; index + (4 * lanes) <= count; index += 4 * lanes) {
+        hn::StoreU(hn::LoadU(d, input + index), d, output + index);
+        hn::StoreU(hn::LoadU(d, input + index + lanes), d,
+                   output + index + lanes);
+        hn::StoreU(hn::LoadU(d, input + index + (2 * lanes)), d,
+                   output + index + (2 * lanes));
+        hn::StoreU(hn::LoadU(d, input + index + (3 * lanes)), d,
+                   output + index + (3 * lanes));
+    }
+    for (; index + lanes <= count; index += lanes) {
+        hn::StoreU(hn::LoadU(d, input + index), d, output + index);
+    }
+    for (; index < count; ++index) {
+        output[index] = input[index];
+    }
+}
+
+template <std::floating_point T>
+inline void add_contiguous_highway(T* VNLB_RESTRICT output,
+                                   const T* VNLB_RESTRICT input,
                                    std::size_t count) noexcept {
     namespace hn = hwy::HWY_NAMESPACE;
     const hn::ScalableTag<T> d;
@@ -212,7 +253,8 @@ inline void add_contiguous_highway(T* output, const T* input,
 }
 
 template <std::floating_point T>
-inline void add_scaled_contiguous_highway(T* output, const T* input, T scale,
+inline void add_scaled_contiguous_highway(T* VNLB_RESTRICT output,
+                                          const T* VNLB_RESTRICT input, T scale,
                                           std::size_t count) noexcept {
     namespace hn = hwy::HWY_NAMESPACE;
     const hn::ScalableTag<T> d;
@@ -262,7 +304,114 @@ inline void add_scaled_contiguous_highway(T* output, const T* input, T scale,
 }
 
 template <std::floating_point T>
-inline void scale_contiguous_highway(T* row, T scale,
+inline void add_scalar_contiguous_highway(T* VNLB_RESTRICT row, T value,
+                                          std::size_t count) noexcept {
+    namespace hn = hwy::HWY_NAMESPACE;
+    const hn::ScalableTag<T> d;
+    const std::size_t lanes = hn::Lanes(d);
+    const auto value_values = hn::Set(d, value);
+
+    std::size_t index = 0;
+    if (count == lanes) {
+        hn::StoreU(hn::Add(hn::LoadU(d, row), value_values), d, row);
+        return;
+    }
+    if (count == (2 * lanes)) {
+        hn::StoreU(hn::Add(hn::LoadU(d, row), value_values), d, row);
+        hn::StoreU(hn::Add(hn::LoadU(d, row + lanes), value_values), d,
+                   row + lanes);
+        return;
+    }
+    for (; index + (4 * lanes) <= count; index += 4 * lanes) {
+        hn::StoreU(hn::Add(hn::LoadU(d, row + index), value_values), d,
+                   row + index);
+        hn::StoreU(hn::Add(hn::LoadU(d, row + index + lanes), value_values), d,
+                   row + index + lanes);
+        hn::StoreU(
+            hn::Add(hn::LoadU(d, row + index + (2 * lanes)), value_values), d,
+            row + index + (2 * lanes));
+        hn::StoreU(
+            hn::Add(hn::LoadU(d, row + index + (3 * lanes)), value_values), d,
+            row + index + (3 * lanes));
+    }
+    for (; index + lanes <= count; index += lanes) {
+        hn::StoreU(hn::Add(hn::LoadU(d, row + index), value_values), d,
+                   row + index);
+    }
+    for (; index < count; ++index) {
+        row[index] += value;
+    }
+}
+
+template <std::floating_point T>
+inline void add_contiguous_and_scalar_contiguous_highway(
+    T* VNLB_RESTRICT output, T* VNLB_RESTRICT scalar_output,
+    const T* VNLB_RESTRICT input, T scalar, std::size_t count) noexcept {
+    namespace hn = hwy::HWY_NAMESPACE;
+    const hn::ScalableTag<T> d;
+    const std::size_t lanes = hn::Lanes(d);
+    const auto scalar_values = hn::Set(d, scalar);
+
+    std::size_t index = 0;
+    if (count == lanes) {
+        hn::StoreU(hn::Add(hn::LoadU(d, output), hn::LoadU(d, input)), d,
+                   output);
+        hn::StoreU(hn::Add(hn::LoadU(d, scalar_output), scalar_values), d,
+                   scalar_output);
+        return;
+    }
+    if (count == (2 * lanes)) {
+        hn::StoreU(hn::Add(hn::LoadU(d, output), hn::LoadU(d, input)), d,
+                   output);
+        hn::StoreU(hn::Add(hn::LoadU(d, scalar_output), scalar_values), d,
+                   scalar_output);
+        hn::StoreU(
+            hn::Add(hn::LoadU(d, output + lanes), hn::LoadU(d, input + lanes)),
+            d, output + lanes);
+        hn::StoreU(hn::Add(hn::LoadU(d, scalar_output + lanes), scalar_values),
+                   d, scalar_output + lanes);
+        return;
+    }
+    for (; index + (4 * lanes) <= count; index += 4 * lanes) {
+        hn::StoreU(
+            hn::Add(hn::LoadU(d, output + index), hn::LoadU(d, input + index)),
+            d, output + index);
+        hn::StoreU(hn::Add(hn::LoadU(d, scalar_output + index), scalar_values),
+                   d, scalar_output + index);
+        hn::StoreU(hn::Add(hn::LoadU(d, output + index + lanes),
+                           hn::LoadU(d, input + index + lanes)),
+                   d, output + index + lanes);
+        hn::StoreU(
+            hn::Add(hn::LoadU(d, scalar_output + index + lanes), scalar_values),
+            d, scalar_output + index + lanes);
+        hn::StoreU(hn::Add(hn::LoadU(d, output + index + (2 * lanes)),
+                           hn::LoadU(d, input + index + (2 * lanes))),
+                   d, output + index + (2 * lanes));
+        hn::StoreU(hn::Add(hn::LoadU(d, scalar_output + index + (2 * lanes)),
+                           scalar_values),
+                   d, scalar_output + index + (2 * lanes));
+        hn::StoreU(hn::Add(hn::LoadU(d, output + index + (3 * lanes)),
+                           hn::LoadU(d, input + index + (3 * lanes))),
+                   d, output + index + (3 * lanes));
+        hn::StoreU(hn::Add(hn::LoadU(d, scalar_output + index + (3 * lanes)),
+                           scalar_values),
+                   d, scalar_output + index + (3 * lanes));
+    }
+    for (; index + lanes <= count; index += lanes) {
+        hn::StoreU(
+            hn::Add(hn::LoadU(d, output + index), hn::LoadU(d, input + index)),
+            d, output + index);
+        hn::StoreU(hn::Add(hn::LoadU(d, scalar_output + index), scalar_values),
+                   d, scalar_output + index);
+    }
+    for (; index < count; ++index) {
+        output[index] += input[index];
+        scalar_output[index] += scalar;
+    }
+}
+
+template <std::floating_point T>
+inline void scale_contiguous_highway(T* VNLB_RESTRICT row, T scale,
                                      std::size_t count) noexcept {
     namespace hn = hwy::HWY_NAMESPACE;
     const hn::ScalableTag<T> d;

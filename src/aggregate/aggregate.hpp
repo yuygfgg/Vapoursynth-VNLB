@@ -64,6 +64,10 @@ class ConstContributionStackView {
         : planes_(planes.data()), layout_(layout) {}
 
     [[nodiscard]] constexpr const float* data() const noexcept { return data_; }
+    [[nodiscard]] constexpr const ContributionPlaneView*
+    planes() const noexcept {
+        return planes_;
+    }
     [[nodiscard]] constexpr bool has_storage() const noexcept {
         return data_ != nullptr || planes_ != nullptr;
     }
@@ -111,6 +115,9 @@ class ContributionStackView {
         : planes_(planes.data()), layout_(layout) {}
 
     [[nodiscard]] constexpr float* data() const noexcept { return data_; }
+    [[nodiscard]] constexpr ContributionPlaneView* planes() const noexcept {
+        return planes_;
+    }
     [[nodiscard]] constexpr bool has_storage() const noexcept {
         return data_ != nullptr || planes_ != nullptr;
     }
