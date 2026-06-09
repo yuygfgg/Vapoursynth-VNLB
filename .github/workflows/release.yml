@@ -84,9 +84,11 @@ jobs:
                 -D CMAKE_BUILD_TYPE=Release \
                 -D CMAKE_INSTALL_PREFIX=/usr \
                 -D BUILD_SHARED_LIBS=OFF \
+                -D HWY_ENABLE_CONTRIB=OFF \
                 -D HWY_ENABLE_EXAMPLES=OFF \
                 -D HWY_ENABLE_TESTS=OFF
-              cmake --build /tmp/highway-build --target install
+              cmake --build /tmp/highway-build --target hwy
+              cmake --install /tmp/highway-build
             cibw_environment: >-
               OpenBLAS_ROOT=/usr
               CMAKE_ARGS="-DVNLB_ENABLE_MARCH_NATIVE=OFF"
@@ -124,9 +126,11 @@ jobs:
                 -D CMAKE_BUILD_TYPE=Release \
                 -D CMAKE_INSTALL_PREFIX=/usr \
                 -D BUILD_SHARED_LIBS=OFF \
+                -D HWY_ENABLE_CONTRIB=OFF \
                 -D HWY_ENABLE_EXAMPLES=OFF \
                 -D HWY_ENABLE_TESTS=OFF
-              cmake --build /tmp/highway-build --target install
+              cmake --build /tmp/highway-build --target hwy
+              cmake --install /tmp/highway-build
             cibw_environment: >-
               OpenBLAS_ROOT=/usr
               CMAKE_ARGS="-DVNLB_ENABLE_MARCH_NATIVE=OFF"
@@ -204,9 +208,11 @@ jobs:
             -D CMAKE_BUILD_TYPE=Release \
             -D CMAKE_INSTALL_PREFIX=C:/highway \
             -D BUILD_SHARED_LIBS=OFF \
+            -D HWY_ENABLE_CONTRIB=OFF \
             -D HWY_ENABLE_EXAMPLES=OFF \
             -D HWY_ENABLE_TESTS=OFF
-          cmake --build build/deps/highway-build --target install
+          cmake --build build/deps/highway-build --target hwy
+          cmake --install build/deps/highway-build
 
           git clone --depth 1 --branch v0.3.33 https://github.com/OpenMathLib/OpenBLAS.git build/deps/OpenBLAS
           make -C build/deps/OpenBLAS -j"${NUMBER_OF_PROCESSORS:-2}" \
