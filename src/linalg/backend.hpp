@@ -4,6 +4,10 @@
 #define VNLB_LINALG_USE_ACCELERATE 0
 #endif
 
+#ifndef VNLB_LINALG_USE_OPENBLAS
+#define VNLB_LINALG_USE_OPENBLAS 0
+#endif
+
 #include "linalg.hpp"
 
 #include <span>
@@ -15,8 +19,10 @@ enum class SymmetricProduct {
     SampleColumns,
 };
 
-inline constexpr bool has_centered_syrk = VNLB_LINALG_USE_ACCELERATE;
-inline constexpr bool has_topk_symmetric_eigen = VNLB_LINALG_USE_ACCELERATE;
+inline constexpr bool has_centered_syrk =
+    VNLB_LINALG_USE_ACCELERATE || VNLB_LINALG_USE_OPENBLAS;
+inline constexpr bool has_topk_symmetric_eigen =
+    VNLB_LINALG_USE_ACCELERATE || VNLB_LINALG_USE_OPENBLAS;
 
 [[nodiscard]] bool compute_centered_syrk(ConstMatrixView<float> samples,
                                          MatrixView<float> output, float scale,

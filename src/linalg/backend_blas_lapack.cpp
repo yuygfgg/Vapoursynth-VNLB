@@ -1,6 +1,14 @@
 #include "backend.hpp"
 
-#include <Accelerate/Accelerate.h>
+#if VNLB_LINALG_USE_ACCELERATE
+#include <vecLib/cblas.h>
+#include <vecLib/clapack.h>
+#elif VNLB_LINALG_USE_OPENBLAS
+#include <cblas.h>
+#include <lapacke.h>
+#else
+#error "A BLAS/LAPACK backend must be selected"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -8,12 +16,24 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace vnlb::linalg::backend {
 namespace {
 
-static_assert(sizeof(__CLPK_integer) == sizeof(int),
+#if VNLB_LINALG_USE_ACCELERATE
+using LapackInteger = __CLPK_integer;
+
+static_assert(std::is_same_v<LapackInteger, int>,
               "Accelerate LAPACK integer size must match int");
+#elif VNLB_LINALG_USE_OPENBLAS
+using LapackInteger = lapack_int;
+
+static_assert(std::is_same_v<blasint, int>,
+              "OpenBLAS BLAS integer size must match int");
+static_assert(std::is_same_v<LapackInteger, int>,
+              "OpenBLAS LAPACK integer size must match int");
+#endif
 
 [[nodiscard]] int checked_blas_int(std::size_t value, const char* name) {
     if (value > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
@@ -32,8 +52,7 @@ template <Real T> T sqrt_value(T value) {
     return sqrt(value);
 }
 
-template <Real T>
-void mirror_upper_to_lower(MatrixView<T> matrix) {
+template <Real T> void mirror_upper_to_lower(MatrixView<T> matrix) {
     for (std::size_t row = 0; row < matrix.rows(); ++row) {
         for (std::size_t col = row + 1; col < matrix.cols(); ++col) {
             matrix(col, row) = matrix(row, col);
@@ -115,9 +134,9 @@ void call_syrk<double>(CBLAS_TRANSPOSE transpose, int dimension, int reduction,
 }
 
 template <Real T>
-bool compute_centered_syrk_accelerate(ConstMatrixView<T> samples,
-                                      MatrixView<T> output, T scale,
-                                      SymmetricProduct product) {
+bool compute_centered_syrk_blas_lapack(ConstMatrixView<T> samples,
+                                       MatrixView<T> output, T scale,
+                                       SymmetricProduct product) {
     if (output.rows() == 0 || output.cols() == 0) {
         return true;
     }
@@ -139,28 +158,29 @@ bool compute_centered_syrk_accelerate(ConstMatrixView<T> samples,
 }
 
 template <Real T>
-int call_syevr(__CLPK_integer dimension, __CLPK_integer first_index,
-               __CLPK_integer last_index, T* matrix, T* eigenvalues,
-               T* eigenvectors, __CLPK_integer* found, __CLPK_integer* support,
-               T* work, __CLPK_integer work_size, __CLPK_integer* iwork,
-               __CLPK_integer iwork_size);
+int call_syevr(LapackInteger dimension, LapackInteger first_index,
+               LapackInteger last_index, T* matrix, T* eigenvalues,
+               T* eigenvectors, LapackInteger* found, LapackInteger* support,
+               T* work, LapackInteger work_size, LapackInteger* iwork,
+               LapackInteger iwork_size);
 
+#if VNLB_LINALG_USE_ACCELERATE
 template <>
-int call_syevr<float>(__CLPK_integer dimension, __CLPK_integer first_index,
-                      __CLPK_integer last_index, float* matrix,
+int call_syevr<float>(LapackInteger dimension, LapackInteger first_index,
+                      LapackInteger last_index, float* matrix,
                       float* eigenvalues, float* eigenvectors,
-                      __CLPK_integer* found, __CLPK_integer* support,
-                      float* work, __CLPK_integer work_size,
-                      __CLPK_integer* iwork, __CLPK_integer iwork_size) {
+                      LapackInteger* found, LapackInteger* support, float* work,
+                      LapackInteger work_size, LapackInteger* iwork,
+                      LapackInteger iwork_size) {
     char jobz = 'V';
     char range = 'I';
     char uplo = 'U';
-    __CLPK_integer lda = dimension;
+    LapackInteger lda = dimension;
     float vl = 0.0F;
     float vu = 0.0F;
     float abstol = 0.0F;
-    __CLPK_integer ldz = dimension;
-    __CLPK_integer info = 0;
+    LapackInteger ldz = dimension;
+    LapackInteger info = 0;
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -176,21 +196,21 @@ int call_syevr<float>(__CLPK_integer dimension, __CLPK_integer first_index,
 }
 
 template <>
-int call_syevr<double>(__CLPK_integer dimension, __CLPK_integer first_index,
-                       __CLPK_integer last_index, double* matrix,
+int call_syevr<double>(LapackInteger dimension, LapackInteger first_index,
+                       LapackInteger last_index, double* matrix,
                        double* eigenvalues, double* eigenvectors,
-                       __CLPK_integer* found, __CLPK_integer* support,
-                       double* work, __CLPK_integer work_size,
-                       __CLPK_integer* iwork, __CLPK_integer iwork_size) {
+                       LapackInteger* found, LapackInteger* support,
+                       double* work, LapackInteger work_size,
+                       LapackInteger* iwork, LapackInteger iwork_size) {
     char jobz = 'V';
     char range = 'I';
     char uplo = 'U';
-    __CLPK_integer lda = dimension;
+    LapackInteger lda = dimension;
     double vl = 0.0;
     double vu = 0.0;
     double abstol = 0.0;
-    __CLPK_integer ldz = dimension;
-    __CLPK_integer info = 0;
+    LapackInteger ldz = dimension;
+    LapackInteger info = 0;
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -204,12 +224,40 @@ int call_syevr<double>(__CLPK_integer dimension, __CLPK_integer first_index,
 #endif
     return static_cast<int>(info);
 }
+#elif VNLB_LINALG_USE_OPENBLAS
+template <>
+int call_syevr<float>(LapackInteger dimension, LapackInteger first_index,
+                      LapackInteger last_index, float* matrix,
+                      float* eigenvalues, float* eigenvectors,
+                      LapackInteger* found, LapackInteger* support, float* work,
+                      LapackInteger work_size, LapackInteger* iwork,
+                      LapackInteger iwork_size) {
+    return static_cast<int>(LAPACKE_ssyevr_work(
+        LAPACK_COL_MAJOR, 'V', 'I', 'U', dimension, matrix, dimension, 0.0F,
+        0.0F, first_index, last_index, 0.0F, found, eigenvalues, eigenvectors,
+        dimension, support, work, work_size, iwork, iwork_size));
+}
+
+template <>
+int call_syevr<double>(LapackInteger dimension, LapackInteger first_index,
+                       LapackInteger last_index, double* matrix,
+                       double* eigenvalues, double* eigenvectors,
+                       LapackInteger* found, LapackInteger* support,
+                       double* work, LapackInteger work_size,
+                       LapackInteger* iwork, LapackInteger iwork_size) {
+    return static_cast<int>(LAPACKE_dsyevr_work(
+        LAPACK_COL_MAJOR, 'V', 'I', 'U', dimension, matrix, dimension, 0.0, 0.0,
+        first_index, last_index, 0.0, found, eigenvalues, eigenvectors,
+        dimension, support, work, work_size, iwork, iwork_size));
+}
+#endif
 
 template <Real T>
-bool topk_symmetric_eigen_accelerate(
-    ConstMatrixView<T> symmetric, std::span<T> eigenvalues,
-    MatrixView<T> eigenvectors, SymmetricEigenWorkspace<T>& workspace,
-    SymmetricEigenResult& result) {
+bool topk_symmetric_eigen_blas_lapack(ConstMatrixView<T> symmetric,
+                                      std::span<T> eigenvalues,
+                                      MatrixView<T> eigenvectors,
+                                      SymmetricEigenWorkspace<T>& workspace,
+                                      SymmetricEigenResult& result) {
     const std::size_t dimension = symmetric.rows();
     const std::size_t rank = eigenvalues.size();
     if (dimension == 0 || rank == 0) {
@@ -222,24 +270,24 @@ bool topk_symmetric_eigen_accelerate(
     MatrixView<T> vectors = workspace.vectors_view();
     copy_matrix(symmetric, matrix);
 
-    const auto n = static_cast<__CLPK_integer>(dimension);
-    const auto first_index = static_cast<__CLPK_integer>(dimension - rank + 1);
-    const auto last_index = static_cast<__CLPK_integer>(dimension);
-    __CLPK_integer found = 0;
+    const auto n = static_cast<LapackInteger>(dimension);
+    const auto first_index = static_cast<LapackInteger>(dimension - rank + 1);
+    const auto last_index = static_cast<LapackInteger>(dimension);
+    LapackInteger found = 0;
     const auto work_size =
-        static_cast<__CLPK_integer>(workspace.lapack_work().size());
+        static_cast<LapackInteger>(workspace.lapack_work().size());
     const auto iwork_size =
-        static_cast<__CLPK_integer>(workspace.lapack_iwork().size());
+        static_cast<LapackInteger>(workspace.lapack_iwork().size());
     auto* iwork =
-        reinterpret_cast<__CLPK_integer*>(workspace.lapack_iwork().data());
+        reinterpret_cast<LapackInteger*>(workspace.lapack_iwork().data());
     auto* support =
-        reinterpret_cast<__CLPK_integer*>(workspace.lapack_support().data());
+        reinterpret_cast<LapackInteger*>(workspace.lapack_support().data());
 
     const int info = call_syevr<T>(
         n, first_index, last_index, matrix.data(),
         workspace.lapack_values().data(), vectors.data(), &found, support,
         workspace.lapack_work().data(), work_size, iwork, iwork_size);
-    if (info != 0 || found != static_cast<__CLPK_integer>(rank)) {
+    if (info != 0 || found != static_cast<LapackInteger>(rank)) {
         result = {.computed = rank, .sweeps = 0, .converged = false};
         return false;
     }
@@ -264,13 +312,13 @@ bool topk_symmetric_eigen_accelerate(
 bool compute_centered_syrk(ConstMatrixView<float> samples,
                            MatrixView<float> output, float scale,
                            SymmetricProduct product) {
-    return compute_centered_syrk_accelerate(samples, output, scale, product);
+    return compute_centered_syrk_blas_lapack(samples, output, scale, product);
 }
 
 bool compute_centered_syrk(ConstMatrixView<double> samples,
                            MatrixView<double> output, double scale,
                            SymmetricProduct product) {
-    return compute_centered_syrk_accelerate(samples, output, scale, product);
+    return compute_centered_syrk_blas_lapack(samples, output, scale, product);
 }
 
 bool topk_symmetric_eigen(ConstMatrixView<float> symmetric,
@@ -278,8 +326,8 @@ bool topk_symmetric_eigen(ConstMatrixView<float> symmetric,
                           MatrixView<float> eigenvectors,
                           SymmetricEigenWorkspace<float>& workspace,
                           SymmetricEigenResult& result) {
-    return topk_symmetric_eigen_accelerate(symmetric, eigenvalues, eigenvectors,
-                                           workspace, result);
+    return topk_symmetric_eigen_blas_lapack(symmetric, eigenvalues,
+                                            eigenvectors, workspace, result);
 }
 
 bool topk_symmetric_eigen(ConstMatrixView<double> symmetric,
@@ -287,8 +335,8 @@ bool topk_symmetric_eigen(ConstMatrixView<double> symmetric,
                           MatrixView<double> eigenvectors,
                           SymmetricEigenWorkspace<double>& workspace,
                           SymmetricEigenResult& result) {
-    return topk_symmetric_eigen_accelerate(symmetric, eigenvalues, eigenvectors,
-                                           workspace, result);
+    return topk_symmetric_eigen_blas_lapack(symmetric, eigenvalues,
+                                            eigenvectors, workspace, result);
 }
 
 } // namespace vnlb::linalg::backend

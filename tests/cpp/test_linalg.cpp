@@ -1,5 +1,7 @@
 #include "linalg/linalg.hpp"
 
+#include "linalg/backend.hpp"
+
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -161,6 +163,43 @@ void test_symmetric_eigen_dense() {
     }
 }
 
+void test_symmetric_eigen_large_diagonal() {
+    constexpr std::size_t dimension = 64;
+    constexpr std::size_t rank = 3;
+
+    std::vector<double> matrix_data(dimension * dimension);
+    for (std::size_t index = 0; index < dimension; ++index) {
+        matrix_data[(index * dimension) + index] =
+            static_cast<double>(index + 1);
+    }
+    const ConstMatrixView<double> matrix(matrix_data.data(), dimension,
+                                         dimension);
+
+    std::vector<double> values(rank);
+    Matrix<double> vectors(rank, dimension);
+    SymmetricEigenWorkspace<double> workspace;
+    const auto result = vnlb::linalg::topk_symmetric_eigen(
+        matrix, std::span<double>(values), vectors.view(), workspace);
+
+    require_close(values[0], 64.0, 1e-12, "largest large eigenvalue");
+    require_close(values[1], 63.0, 1e-12, "second large eigenvalue");
+    require_close(values[2], 62.0, 1e-12, "third large eigenvalue");
+    require_eigen_residual(matrix, vectors.cview(),
+                           std::span<const double>(values), 1e-12);
+    if (!result.converged || result.computed != rank) {
+        std::cerr << "large diagonal eigen solve did not converge\n";
+        std::exit(EXIT_FAILURE);
+    }
+
+    if constexpr (vnlb::linalg::backend::has_topk_symmetric_eigen) {
+        if (result.sweeps != 0) {
+            std::cerr
+                << "large eigen solve did not use the BLAS/LAPACK backend\n";
+            std::exit(EXIT_FAILURE);
+        }
+    }
+}
+
 void test_dual_basis_and_projection() {
     const std::vector<double> centered_data{1.0, 0.0, -1.0, 0.0};
     const ConstMatrixView<double> centered(centered_data.data(), 2, 2);
@@ -200,6 +239,7 @@ int main() {
     test_mean_center_gram_covariance();
     test_symmetric_eigen_diagonal();
     test_symmetric_eigen_dense();
+    test_symmetric_eigen_large_diagonal();
     test_dual_basis_and_projection();
     return EXIT_SUCCESS;
 }

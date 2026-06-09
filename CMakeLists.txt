@@ -34,6 +34,7 @@ configure_file(
 option(VNLB_BUILD_PLUGIN "Build the VapourSynth native plugin target" OFF)
 option(VNLB_ENABLE_TESTS "Enable project tests" ON)
 option(VNLB_ENABLE_LAPACK "Enable a LAPACK-compatible eigensolver backend" ON)
+option(VNLB_ENABLE_ACCELERATE "Enable the Accelerate BLAS/LAPACK backend on Apple platforms" ON)
 option(VNLB_ENABLE_CBLAS "Enable optional CBLAS kernels after benchmarking" OFF)
 option(VNLB_ENABLE_WARNINGS "Enable project warning flags" ON)
 option(VNLB_ENABLE_WARNINGS_AS_ERRORS "Treat project warnings as errors" OFF)
@@ -66,13 +67,194 @@ if(VNLB_ENABLE_MARCH_NATIVE AND NOT MSVC)
   )
 endif()
 
-set(VNLB_LINALG_BACKEND_SOURCE)
-set(VNLB_LINALG_USE_ACCELERATE OFF)
-if(APPLE AND VNLB_ENABLE_LAPACK)
-  set(VNLB_LINALG_USE_ACCELERATE ON)
-  set(VNLB_LINALG_BACKEND_SOURCE
-    src/linalg/backend_accelerate.cpp
+function(vnlb_collect_openblas_roots out_var)
+  set(_roots)
+  foreach(_var IN ITEMS OpenBLAS_ROOT OPENBLAS_ROOT)
+    if(DEFINED ${_var})
+      list(APPEND _roots "${${_var}}")
+    endif()
+    if(DEFINED ENV{${_var}})
+      list(APPEND _roots "$ENV{${_var}}")
+    endif()
+  endforeach()
+
+  if(APPLE)
+    list(APPEND _roots
+      "/opt/homebrew/opt/openblas"
+      "/usr/local/opt/openblas"
+    )
+  endif()
+  list(APPEND _roots
+    "/opt/OpenBLAS"
+    "/opt/openblas"
+    "/opt/local"
+    "/usr/local"
+    "/usr"
   )
+  list(REMOVE_DUPLICATES _roots)
+  set(${out_var} ${_roots} PARENT_SCOPE)
+endfunction()
+
+function(vnlb_make_openblas_target_from_vars out_var)
+  set(_includes)
+  foreach(_candidate IN LISTS
+      OpenBLAS_INCLUDE_DIRS
+      OpenBLAS_INCLUDE_DIR
+      OPENBLAS_INCLUDE_DIRS
+      OPENBLAS_INCLUDE_DIR
+  )
+    if(_candidate)
+      list(APPEND _includes "${_candidate}")
+    endif()
+  endforeach()
+
+  set(_libraries)
+  foreach(_candidate IN LISTS
+      OpenBLAS_LIBRARIES
+      OpenBLAS_LIBRARY
+      OPENBLAS_LIBRARIES
+      OPENBLAS_LIBRARY
+  )
+    if(_candidate)
+      list(APPEND _libraries "${_candidate}")
+    endif()
+  endforeach()
+
+  if(_includes AND _libraries)
+    list(REMOVE_DUPLICATES _includes)
+    list(REMOVE_DUPLICATES _libraries)
+    if(NOT TARGET vnlb_openblas)
+      add_library(vnlb_openblas INTERFACE)
+      target_include_directories(vnlb_openblas SYSTEM INTERFACE ${_includes})
+      target_link_libraries(vnlb_openblas INTERFACE ${_libraries})
+    endif()
+    set(${out_var} vnlb_openblas PARENT_SCOPE)
+  else()
+    set(${out_var} "" PARENT_SCOPE)
+  endif()
+endfunction()
+
+function(vnlb_find_openblas out_var)
+  set(${out_var} "" PARENT_SCOPE)
+  vnlb_collect_openblas_roots(_openblas_roots)
+
+  find_package(OpenBLAS CONFIG QUIET HINTS ${_openblas_roots})
+  if(TARGET OpenBLAS::OpenBLAS)
+    set(${out_var} OpenBLAS::OpenBLAS PARENT_SCOPE)
+    return()
+  elseif(TARGET OpenBLAS::openblas)
+    set(${out_var} OpenBLAS::openblas PARENT_SCOPE)
+    return()
+  elseif(OpenBLAS_FOUND)
+    vnlb_make_openblas_target_from_vars(_openblas_target)
+    if(_openblas_target)
+      set(${out_var} ${_openblas_target} PARENT_SCOPE)
+      return()
+    endif()
+  endif()
+
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(VNLB_OPENBLAS_PC QUIET openblas)
+  endif()
+
+  set(_openblas_include_hints
+    ${_openblas_roots}
+    ${VNLB_OPENBLAS_PC_INCLUDE_DIRS}
+  )
+  find_path(VNLB_OPENBLAS_CBLAS_INCLUDE_DIR
+    NAMES cblas.h
+    HINTS ${_openblas_include_hints}
+    PATH_SUFFIXES include include/openblas
+  )
+  find_path(VNLB_OPENBLAS_LAPACKE_INCLUDE_DIR
+    NAMES lapacke.h
+    HINTS ${_openblas_include_hints}
+    PATH_SUFFIXES include include/openblas
+  )
+
+  set(_openblas_library_hints
+    ${_openblas_roots}
+    ${VNLB_OPENBLAS_PC_LIBRARY_DIRS}
+  )
+  find_library(VNLB_OPENBLAS_LIBRARY
+    NAMES openblas openblasp
+    HINTS ${_openblas_library_hints}
+    PATH_SUFFIXES lib lib64
+  )
+  find_library(VNLB_LAPACKE_LIBRARY
+    NAMES lapacke
+    HINTS ${_openblas_library_hints}
+    PATH_SUFFIXES lib lib64
+  )
+
+  mark_as_advanced(
+    VNLB_OPENBLAS_CBLAS_INCLUDE_DIR
+    VNLB_OPENBLAS_LAPACKE_INCLUDE_DIR
+    VNLB_OPENBLAS_LIBRARY
+    VNLB_LAPACKE_LIBRARY
+  )
+
+  if(VNLB_OPENBLAS_CBLAS_INCLUDE_DIR AND
+      VNLB_OPENBLAS_LAPACKE_INCLUDE_DIR AND
+      VNLB_OPENBLAS_LIBRARY)
+    set(_openblas_includes
+      "${VNLB_OPENBLAS_CBLAS_INCLUDE_DIR}"
+      "${VNLB_OPENBLAS_LAPACKE_INCLUDE_DIR}"
+    )
+    list(REMOVE_DUPLICATES _openblas_includes)
+    set(_openblas_libraries)
+    if(VNLB_LAPACKE_LIBRARY)
+      list(APPEND _openblas_libraries "${VNLB_LAPACKE_LIBRARY}")
+    endif()
+    list(APPEND _openblas_libraries "${VNLB_OPENBLAS_LIBRARY}")
+    if(NOT TARGET vnlb_openblas)
+      add_library(vnlb_openblas INTERFACE)
+      target_include_directories(vnlb_openblas SYSTEM INTERFACE
+        ${_openblas_includes}
+      )
+      target_link_libraries(vnlb_openblas INTERFACE
+        ${_openblas_libraries}
+      )
+    endif()
+    set(${out_var} vnlb_openblas PARENT_SCOPE)
+  endif()
+endfunction()
+
+set(VNLB_LINALG_BACKEND_SOURCE)
+set(VNLB_LINALG_BACKEND "handwritten")
+set(VNLB_LINALG_BACKEND_LIBRARIES)
+set(VNLB_LINALG_USE_ACCELERATE OFF)
+set(VNLB_LINALG_USE_OPENBLAS OFF)
+if(VNLB_ENABLE_LAPACK)
+  if(APPLE AND VNLB_ENABLE_ACCELERATE)
+    find_library(VNLB_ACCELERATE_FRAMEWORK Accelerate)
+    mark_as_advanced(VNLB_ACCELERATE_FRAMEWORK)
+    if(VNLB_ACCELERATE_FRAMEWORK)
+      set(VNLB_LINALG_BACKEND "Accelerate")
+      set(VNLB_LINALG_USE_ACCELERATE ON)
+      set(VNLB_LINALG_BACKEND_SOURCE
+        src/linalg/backend_blas_lapack.cpp
+      )
+      list(APPEND VNLB_LINALG_BACKEND_LIBRARIES
+        "${VNLB_ACCELERATE_FRAMEWORK}"
+      )
+    endif()
+  endif()
+
+  if(NOT VNLB_LINALG_BACKEND_SOURCE)
+    vnlb_find_openblas(VNLB_OPENBLAS_TARGET)
+    if(VNLB_OPENBLAS_TARGET)
+      set(VNLB_LINALG_BACKEND "OpenBLAS")
+      set(VNLB_LINALG_USE_OPENBLAS ON)
+      set(VNLB_LINALG_BACKEND_SOURCE
+        src/linalg/backend_blas_lapack.cpp
+      )
+      list(APPEND VNLB_LINALG_BACKEND_LIBRARIES
+        ${VNLB_OPENBLAS_TARGET}
+      )
+    endif()
+  endif()
 endif()
 
 set(VNLB_LINALG_USE_AARCH64_NEON OFF)
@@ -95,13 +277,13 @@ target_link_libraries(vnlb_linalg
 target_compile_definitions(vnlb_linalg
   PUBLIC
     VNLB_LINALG_USE_AARCH64_NEON=$<BOOL:${VNLB_LINALG_USE_AARCH64_NEON}>
-  PRIVATE
     VNLB_LINALG_USE_ACCELERATE=$<BOOL:${VNLB_LINALG_USE_ACCELERATE}>
+    VNLB_LINALG_USE_OPENBLAS=$<BOOL:${VNLB_LINALG_USE_OPENBLAS}>
 )
-if(APPLE AND VNLB_ENABLE_LAPACK)
+if(VNLB_LINALG_BACKEND_LIBRARIES)
   target_link_libraries(vnlb_linalg
     PUBLIC
-      "-framework Accelerate"
+      ${VNLB_LINALG_BACKEND_LIBRARIES}
   )
 endif()
 set_target_properties(vnlb_linalg PROPERTIES
@@ -251,9 +433,12 @@ endif()
 message(STATUS "VNLB configured")
 message(STATUS "  VNLB_BUILD_PLUGIN: ${VNLB_BUILD_PLUGIN}")
 message(STATUS "  VNLB_ENABLE_LAPACK: ${VNLB_ENABLE_LAPACK}")
+message(STATUS "  VNLB_ENABLE_ACCELERATE: ${VNLB_ENABLE_ACCELERATE}")
 message(STATUS "  VNLB_ENABLE_CBLAS: ${VNLB_ENABLE_CBLAS}")
 message(STATUS "  VNLB_USE_LTO: ${VNLB_USE_LTO}")
 message(STATUS "  VNLB_ENABLE_MARCH_NATIVE: ${VNLB_ENABLE_MARCH_NATIVE}")
+message(STATUS "  VNLB_LINALG_BACKEND: ${VNLB_LINALG_BACKEND}")
 message(STATUS "  VNLB_LINALG_USE_ACCELERATE: ${VNLB_LINALG_USE_ACCELERATE}")
+message(STATUS "  VNLB_LINALG_USE_OPENBLAS: ${VNLB_LINALG_USE_OPENBLAS}")
 message(STATUS "  VNLB_LINALG_USE_AARCH64_NEON: ${VNLB_LINALG_USE_AARCH64_NEON}")
 message(STATUS "  VNLB_CORE_USE_AARCH64_NEON: ${VNLB_CORE_USE_AARCH64_NEON}")
