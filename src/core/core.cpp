@@ -713,9 +713,8 @@ void scan_basic_spatial_distances(ConstVideoView noisy, int x_low, int x_high,
                     candidate_x;
 
                 for (int y = 0; y < patch_size; ++y) {
-                    distance = distance::add_bounded_squared_row_distance(
-                        distance, reference_row, candidate_row, patch_size,
-                        distance_limit);
+                    distance = distance::add_squared_row_distance(
+                        distance, reference_row, candidate_row, patch_size);
                     if (distance > distance_limit) {
                         break;
                     }
@@ -774,9 +773,8 @@ void scan_final_spatial_distances(
                         candidate_x;
 
                     for (int y = 0; y < patch_size; ++y) {
-                        distance = distance::add_bounded_squared_row_distance(
-                            distance, reference_row, candidate_row, patch_size,
-                            distance_limit);
+                        distance = distance::add_squared_row_distance(
+                            distance, reference_row, candidate_row, patch_size);
                         if (distance > distance_limit) {
                             break;
                         }

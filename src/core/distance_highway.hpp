@@ -6,14 +6,14 @@
 
 namespace vnlb::core::distance {
 
-[[nodiscard]] inline float add_bounded_squared_row_distance_highway(
+[[nodiscard]] inline float add_squared_row_distance_highway(
     float distance, const float* left, const float* right, int count) noexcept {
     if (count <= 0) {
         return distance;
     }
 
     namespace hn = hwy::HWY_NAMESPACE;
-    const hn::CappedTag<float, 4> d;
+    const hn::ScalableTag<float> d;
     const std::size_t lanes = hn::Lanes(d);
     const auto total = static_cast<std::size_t>(count);
 
