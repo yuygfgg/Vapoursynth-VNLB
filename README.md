@@ -13,6 +13,8 @@ Supported input formats:
 - `GrayS`
 - `YUV444PS`
 
+Note: It is recommended to convert your source into OPP colorspace before calling VNLB, as the plugin does not perform any internal color-space conversion.
+
 ## Installation
 
 ```
@@ -274,6 +276,14 @@ python3 tests/vs/integration_bestsource.py \
 
 - The implementation does not copy the original VNLB reference source, so output is not bit-exact.
 - MVTools support is nearest-block sampling of the finest vector level.
+
+## References
+
+- Pablo Arias and Jean-Michel Morel, "Video Denoising via Empirical Bayesian
+  Estimation of Space-Time Patches", Journal of Mathematical Imaging and
+  Vision, 60(1), 70-93, 2018.
+  <https://doi.org/10.1007/s10851-017-0742-4>
+- <https://github.com/pariasm/vnlb>
 
 ## License
 
