@@ -28,7 +28,7 @@ pip install -U vapoursynth-vnlb
 This basic estimate produces a decent estimate of the noise-free image, as a reference for the final estimate.
 
 ```python
-vnlb.Basic(clip clip, float sigma[, int block_size=8, int block_step=8, int group_size=8, float cap_factor=4.0, float model_cap_factor=1.0, int bm_range=9, int patch_time=1, int radius=1, int search_bwd=1, int search_fwd=1, int rank=8, float beta=1.0, float tau=0.0, float variance_threshold=1.1, float sigma_basic=0.0, float gamma=0.95, int flat_areas=0, int chroma=0, clip mvfw=None, clip mvbw=None])
+vnlb.Basic(clip clip, float sigma[, int block_size=8, int block_step=8, int group_size=8, float cap_factor=4.0, float model_cap_factor=1.0, int bm_range=9, int patch_time=1, int radius=1, int search_bwd=1, int search_fwd=1, int rank=8, float beta=1.0, float tau=0.0, float variance_threshold=1.1, float sigma_basic=0.0, float gamma=0.95, int flat_areas=0, int chroma=1, clip mvfw=None, clip mvbw=None])
 ```
 
 - clip:
@@ -41,7 +41,7 @@ vnlb.Basic(clip clip, float sigma[, int block_size=8, int block_step=8, int grou
     The size of a spatial block is block_size x block_size, representing a local patch. A value of `8` uses `8x8` patches. Generally, larger blocks capture broader structure but cost more and can blur small details if the rank is too low.
 
 - block_step:
-    Sliding step to process every next reference block (anchor block spacing). Lower values process more anchor positions and reduce sparse-anchor artifacts; higher values are faster. The default is `8`.
+    Sliding step to process every next reference block (anchor block spacing). Lower values process more anchor positions and reduce sparse-anchor artifacts; higher values are faster. The default is `8`. Set `block_step=0` to use the automatic step, which is `block_size`.
 
 - group_size:
     Maximum number of similar blocks in each group before threshold expansion. More patches improve averaging stability but increase cost and may smooth texture when the search admits weak matches.
@@ -86,7 +86,7 @@ vnlb.Basic(clip clip, float sigma[, int block_size=8, int block_step=8, int grou
     Enables the flat-area path. Can improve very flat regions, but may smooth low-contrast texture. Basic defaults to `0`; Final defaults to `1`.
 
 - chroma:
-    For `YUV444PS`, `chroma=1` estimates one coupled multi-channel model across Y, U, and V. With `chroma=0`, planes are processed independently. Gray clips ignore this setting.
+    Defaults to `1`. For `YUV444PS`, `chroma=1` estimates one coupled multi-channel model across Y, U, and V. Use `chroma=0` to process planes independently. `GrayS` clips ignore this setting.
 
 - mvfw, mvbw:
     Optional MVTools vector clips. They guide temporal search centers but do not replace exhaustive patch search inside `bm_range`. `mvfw` must come from `isb=False`, and `mvbw` from `isb=True`, both with `delta=1` and dimensions matching `clip`.
@@ -163,7 +163,7 @@ final = core.vnlb.Aggregate(
 final.set_output()
 ```
 
-For `YUV444PS`, set `chroma=1` to estimate a coupled multi-channel model. Without it, planes are processed independently.
+For `YUV444PS`, `chroma` defaults to `1`, estimating a coupled multi-channel model. Set `chroma=0` to process planes independently.
 
 ### MVTools Motion Guidance Example
 

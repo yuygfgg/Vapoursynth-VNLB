@@ -15,10 +15,6 @@
 namespace vnlb::core {
 namespace {
 
-constexpr float kEightBitSampleScale = 255.0F;
-constexpr float kEightBitDistanceScale =
-    kEightBitSampleScale * kEightBitSampleScale;
-
 void require(bool condition, const char* message) {
     if (!condition) {
         throw std::invalid_argument(message);
@@ -41,10 +37,14 @@ void require(bool condition, const char* message) {
 
 [[nodiscard]] int normalized_proc_step(Stage stage,
                                        StageParameters parameters) noexcept {
+    (void)stage;
     if (parameters.proc_step > 0) {
         return parameters.proc_step;
     }
-    return default_proc_step(stage, parameters.patch_size);
+    if (parameters.patch_size <= 1) {
+        return 1;
+    }
+    return parameters.patch_size;
 }
 
 [[nodiscard]] int patch_position(int patch_size, int x, int y, int t) noexcept {
@@ -1083,8 +1083,8 @@ void gather_basic_samples_coupled_planes(
 void gather_basic_samples_coupled(ConstVideoView noisy,
                                   StageWorkspace& workspace, int similar) {
     if (const ConstPlaneView* planes = noisy.planes(); planes != nullptr) {
-        gather_basic_samples_coupled_planes(noisy.geometry(), planes,
-                                            workspace, similar);
+        gather_basic_samples_coupled_planes(noisy.geometry(), planes, workspace,
+                                            similar);
         return;
     }
 
@@ -1216,9 +1216,9 @@ void gather_final_samples_coupled(ConstVideoView noisy, ConstVideoView basic,
         noisy_planes != nullptr) {
         if (const ConstPlaneView* basic_planes = basic.planes();
             basic_planes != nullptr) {
-            gather_final_samples_coupled_planes(
-                noisy.geometry(), noisy_planes, basic_planes, workspace,
-                similar);
+            gather_final_samples_coupled_planes(noisy.geometry(), noisy_planes,
+                                                basic_planes, workspace,
+                                                similar);
             return;
         }
     }
@@ -1342,17 +1342,16 @@ void write_sample_contributions_coupled_contiguous(
                 const int row_offset = (output_y * layout.width) + match.x;
                 float* weight_row =
                     data + (slot * slot_stride) + weight_plane + row_offset;
-                linalg::kernels::add_scalar_contiguous(weight_row, 1.0F,
-                                                       count);
+                linalg::kernels::add_scalar_contiguous(weight_row, 1.0F, count);
 
                 for (int channel = 0; channel < channels; ++channel) {
                     const float* sample_row =
                         row + (channel * patch_dim) + position;
-                    float* numerator_row =
-                        data + (slot * slot_stride) +
-                        (channel * plane_pixels) + row_offset;
+                    float* numerator_row = data + (slot * slot_stride) +
+                                           (channel * plane_pixels) +
+                                           row_offset;
                     linalg::kernels::add_contiguous(numerator_row, sample_row,
-                                                   count);
+                                                    count);
                 }
             }
         }
@@ -1396,11 +1395,10 @@ void write_sample_contributions_coupled_planes(
                         (static_cast<std::ptrdiff_t>(numerator_row) *
                          plane.stride) +
                         match.x;
-                    float* weight =
-                        plane.data +
-                        (static_cast<std::ptrdiff_t>(weight_row) *
-                         plane.stride) +
-                        match.x;
+                    float* weight = plane.data +
+                                    (static_cast<std::ptrdiff_t>(weight_row) *
+                                     plane.stride) +
+                                    match.x;
                     linalg::kernels::add_contiguous_and_scalar_contiguous(
                         numerator, weight, sample_row, 1.0F, count);
                 }
@@ -1415,13 +1413,13 @@ void write_sample_contributions_coupled(
     const auto layout = stack.layout();
     if (aggregate::ContributionPlaneView* planes = stack.planes();
         planes != nullptr) {
-        write_sample_contributions_coupled_planes(
-            workspace, anchor_frame, similar, layout, planes);
+        write_sample_contributions_coupled_planes(workspace, anchor_frame,
+                                                  similar, layout, planes);
         return;
     }
     if (float* data = stack.data(); data != nullptr) {
-        write_sample_contributions_coupled_contiguous(
-            workspace, anchor_frame, similar, layout, data);
+        write_sample_contributions_coupled_contiguous(workspace, anchor_frame,
+                                                      similar, layout, data);
     }
 }
 
@@ -1492,8 +1490,7 @@ process_anchor_impl(ConstVideoView noisy, ConstVideoView reference,
     for (int anchor_y = 0; anchor_y <= max_y; ++anchor_y) {
         for (int anchor_x = 0; anchor_x <= max_x; ++anchor_x) {
             if (workspace.processing_mask_[static_cast<std::size_t>(
-                    (anchor_y * geometry.width) + anchor_x)] ==
-                0) {
+                    (anchor_y * geometry.width) + anchor_x)] == 0) {
                 continue;
             }
 
@@ -1531,8 +1528,8 @@ process_anchor_impl(ConstVideoView noisy, ConstVideoView reference,
             workspace.output_sample_major_ = false;
             process_group(similar);
             if (workspace.output_sample_major_) {
-                write_sample_contributions_coupled(
-                    workspace, anchor_frame, similar, contributions);
+                write_sample_contributions_coupled(workspace, anchor_frame,
+                                                   similar, contributions);
             } else {
                 write_group_contributions(workspace, anchor_frame, similar,
                                           contributions);
@@ -1546,38 +1543,6 @@ process_anchor_impl(ConstVideoView noisy, ConstVideoView reference,
 }
 
 } // namespace
-
-StageParameters make_basic_parameters(float sigma) {
-    StageParameters parameters{};
-    parameters.sigma = sigma;
-    parameters.beta = 1.0F;
-    parameters.tau = 0.0F;
-    parameters.variance_threshold = 1.1F;
-    parameters.flat_areas = false;
-    parameters.proc_step =
-        default_proc_step(Stage::Basic, parameters.patch_size);
-    return parameters;
-}
-
-StageParameters make_final_parameters(float sigma) {
-    StageParameters parameters{};
-    parameters.sigma = sigma;
-    parameters.beta = 1.0F;
-    parameters.tau = 400.0F / kEightBitDistanceScale;
-    parameters.variance_threshold = 1.7F;
-    parameters.flat_areas = true;
-    parameters.proc_step =
-        default_proc_step(Stage::Final, parameters.patch_size);
-    return parameters;
-}
-
-int default_proc_step(Stage stage, int patch_size) noexcept {
-    (void)stage;
-    if (patch_size <= 1) {
-        return 1;
-    }
-    return patch_size;
-}
 
 void validate_stage_parameters(StageParameters parameters, Stage stage) {
     require(parameters.sigma > 0.0F, "sigma must be positive");
@@ -1686,8 +1651,7 @@ ProcessStats process_basic_anchor_no_flow(
     aggregate::ContributionStackView contributions, StageWorkspace& workspace) {
     return process_anchor_impl(
         noisy, ConstVideoView{}, anchor_frame, Stage::Basic, parameters,
-        flow_provider, contributions, workspace,
-        [&](int similar) {
+        flow_provider, contributions, workspace, [&](int similar) {
             if (parameters.couple_channels && noisy.geometry().channels > 1) {
                 gather_basic_samples_coupled(noisy, workspace, similar);
                 transform_vnlb_coupled_samples(workspace, Stage::Basic,
@@ -1705,8 +1669,7 @@ ProcessStats process_final_anchor_no_flow(
     aggregate::ContributionStackView contributions, StageWorkspace& workspace) {
     return process_anchor_impl(
         noisy, basic, anchor_frame, Stage::Final, parameters, flow_provider,
-        contributions, workspace,
-        [&](int similar) {
+        contributions, workspace, [&](int similar) {
             if (parameters.couple_channels && noisy.geometry().channels > 1) {
                 gather_final_samples_coupled(noisy, basic, workspace, similar);
                 transform_vnlb_coupled_samples(workspace, Stage::Final,
@@ -1724,8 +1687,7 @@ ProcessStats process_basic_anchor_mvtools(
     aggregate::ContributionStackView contributions, StageWorkspace& workspace) {
     return process_anchor_impl(
         noisy, ConstVideoView{}, anchor_frame, Stage::Basic, parameters,
-        flow_provider, contributions, workspace,
-        [&](int similar) {
+        flow_provider, contributions, workspace, [&](int similar) {
             if (parameters.couple_channels && noisy.geometry().channels > 1) {
                 gather_basic_samples_coupled(noisy, workspace, similar);
                 transform_vnlb_coupled_samples(workspace, Stage::Basic,
@@ -1743,8 +1705,7 @@ ProcessStats process_final_anchor_mvtools(
     aggregate::ContributionStackView contributions, StageWorkspace& workspace) {
     return process_anchor_impl(
         noisy, basic, anchor_frame, Stage::Final, parameters, flow_provider,
-        contributions, workspace,
-        [&](int similar) {
+        contributions, workspace, [&](int similar) {
             if (parameters.couple_channels && noisy.geometry().channels > 1) {
                 gather_final_samples_coupled(noisy, basic, workspace, similar);
                 transform_vnlb_coupled_samples(workspace, Stage::Final,

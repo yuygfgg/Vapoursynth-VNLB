@@ -206,12 +206,13 @@ struct FrameListGuard {
 
 [[nodiscard]] StageParameters
 parse_stage_parameters(const VSMap* in, const VSAPI* vsapi, Stage stage) {
-    StageParameters parameters =
-        stage == Stage::Basic
-            ? vnlb::core::make_basic_parameters(
-                  map_get_required_sigma_8bit(in, vsapi, "sigma"))
-            : vnlb::core::make_final_parameters(
-                  map_get_required_sigma_8bit(in, vsapi, "sigma"));
+    StageParameters parameters{};
+    parameters.sigma = map_get_required_sigma_8bit(in, vsapi, "sigma");
+    if (stage == Stage::Final) {
+        parameters.tau = 400.0F / kEightBitDistanceScale;
+        parameters.variance_threshold = 1.7F;
+        parameters.flat_areas = true;
+    }
 
     parameters.patch_size =
         map_get_optional_int(in, vsapi, "block_size", parameters.patch_size);
@@ -771,11 +772,11 @@ void request_aggregate_frames(const VAggregateData* data, int frame,
                     const int base_row = numerator_base_rows[index];
                     const auto* contribution_ptr = contribution_ptrs[index];
                     const int contribution_stride = contribution_strides[index];
-                    numerator +=
-                        contribution_ptr[((base_row + y) * contribution_stride) +
-                                         x];
-                    weight += contribution_ptr[((base_row + height + y) *
+                    numerator += contribution_ptr[((base_row + y) *
                                                    contribution_stride) +
+                                                  x];
+                    weight += contribution_ptr[((base_row + height + y) *
+                                                contribution_stride) +
                                                x];
                 }
                 dst_row[x] = weight > 0.0F ? numerator / weight : src_row[x];
@@ -906,10 +907,10 @@ void VS_CC FinalCreate(const VSMap* in, VSMap* out,
 
 VS_EXTERNAL_API(void)
 VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
-    vspapi->configPlugin(kPluginId, kPluginNamespace, "VapourSynth VNLB",
-                         VS_MAKE_VERSION(VNLB_VERSION_MAJOR,
-                                         VNLB_VERSION_MINOR),
-                         VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin(
+        kPluginId, kPluginNamespace, "VapourSynth VNLB",
+        VS_MAKE_VERSION(VNLB_VERSION_MAJOR, VNLB_VERSION_MINOR),
+        VAPOURSYNTH_API_VERSION, 0, plugin);
 
     constexpr const char* stage_args =
         "clip:vnode;sigma:float;block_size:int:opt;block_step:int:opt;"

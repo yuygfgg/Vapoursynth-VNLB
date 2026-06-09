@@ -30,11 +30,11 @@ struct StageParameters {
     float variance_threshold = 1.1F;
     float sigma_basic = 0.0F;
     float gamma = 0.95F;
-    int proc_step = 0;
+    int proc_step = 8;
     bool aggregation_window = false;
     bool order_invariance = false;
     bool flat_areas = false;
-    bool couple_channels = false;
+    bool couple_channels = true;
 };
 
 struct ProcessStats {
@@ -91,10 +91,6 @@ class StageWorkspace {
     std::vector<unsigned char> processing_mask_;
     bool output_sample_major_ = false;
 };
-
-[[nodiscard]] StageParameters make_basic_parameters(float sigma);
-[[nodiscard]] StageParameters make_final_parameters(float sigma);
-[[nodiscard]] int default_proc_step(Stage stage, int patch_size) noexcept;
 
 void validate_stage_parameters(StageParameters parameters, Stage stage);
 void validate_stage_configuration(VideoGeometry geometry,

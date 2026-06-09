@@ -80,38 +80,25 @@ void test_aggregate_frame() {
 }
 
 void test_stage_parameter_defaults() {
-    const auto basic = vnlb::core::make_basic_parameters(0.1F);
-    require(basic.patch_size == 8, "basic default block size");
-    require(basic.search_window == 19, "basic default search window");
-    require(basic.search_bwd == 1 && basic.search_fwd == 1,
-            "basic default temporal radius");
-    require(basic.similar == 8, "basic default group size");
-    require(basic.rank == 8, "basic default rank");
-    require_close(basic.similar_cap_factor, 4.0F, 1.0e-6F,
-                  "basic default cap factor");
-    require_close(basic.model_cap_factor, 1.0F, 1.0e-6F,
-                  "basic default model cap factor");
-    require(basic.proc_step == 8, "basic default block step");
-    require_close(basic.tau, 0.0F, 1.0e-9F, "basic default tau");
-
-    const auto final = vnlb::core::make_final_parameters(0.1F);
-    require(final.patch_size == 8, "final default block size");
-    require(final.search_window == 19, "final default search window");
-    require(final.search_bwd == 1 && final.search_fwd == 1,
-            "final default temporal radius");
-    require(final.similar == 8, "final default group size");
-    require(final.rank == 8, "final default rank");
-    require_close(final.similar_cap_factor, 4.0F, 1.0e-6F,
-                  "final default cap factor");
-    require_close(final.model_cap_factor, 1.0F, 1.0e-6F,
-                  "final default model cap factor");
-    require(final.proc_step == 8, "final default block step");
-    require_close(final.tau, 400.0F / (255.0F * 255.0F), 1.0e-9F,
-                  "final default tau");
+    const vnlb::core::StageParameters parameters{};
+    require(parameters.patch_size == 8, "default block size");
+    require(parameters.search_window == 19, "default search window");
+    require(parameters.search_bwd == 1 && parameters.search_fwd == 1,
+            "default temporal radius");
+    require(parameters.similar == 8, "default group size");
+    require(parameters.rank == 8, "default rank");
+    require_close(parameters.similar_cap_factor, 4.0F, 1.0e-6F,
+                  "default cap factor");
+    require_close(parameters.model_cap_factor, 1.0F, 1.0e-6F,
+                  "default model cap factor");
+    require(parameters.proc_step == 8, "default block step");
+    require(parameters.couple_channels, "default coupled chroma");
+    require_close(parameters.tau, 0.0F, 1.0e-9F, "default tau");
 }
 
 vnlb::core::StageParameters constant_test_parameters() {
-    auto parameters = vnlb::core::make_basic_parameters(0.1F);
+    vnlb::core::StageParameters parameters{};
+    parameters.sigma = 0.1F;
     parameters.patch_size = 2;
     parameters.patch_time = 1;
     parameters.search_window = 3;
