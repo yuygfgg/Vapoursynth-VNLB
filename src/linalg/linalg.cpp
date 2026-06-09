@@ -237,6 +237,11 @@ template <Real T> void normalize_or_zero(T* row, std::size_t count, T floor) {
     kernels::scale_contiguous(row, scale, count);
 }
 
+[[nodiscard]] bool worth_calling_syrk_backend(std::size_t dimension) noexcept {
+    constexpr std::size_t backend_min_dimension = 32;
+    return dimension >= backend_min_dimension;
+}
+
 } // namespace
 
 template <Real T> Matrix<T>::Matrix(std::size_t rows, std::size_t cols) {
@@ -320,7 +325,8 @@ void compute_gram_centered(ConstMatrixView<T> centered_samples,
 
     if constexpr (backend::has_centered_syrk &&
                   (std::same_as<T, float> || std::same_as<T, double>)) {
-        if (backend::compute_centered_syrk(
+        if (worth_calling_syrk_backend(gram.rows()) &&
+            backend::compute_centered_syrk(
                 centered_samples, gram, scale,
                 backend::SymmetricProduct::SampleRows)) {
             return;
@@ -370,7 +376,8 @@ void compute_covariance_centered(ConstMatrixView<T> centered_samples,
 
     if constexpr (backend::has_centered_syrk &&
                   (std::same_as<T, float> || std::same_as<T, double>)) {
-        if (backend::compute_centered_syrk(
+        if (worth_calling_syrk_backend(covariance.rows()) &&
+            backend::compute_centered_syrk(
                 centered_samples, covariance, scale,
                 backend::SymmetricProduct::SampleColumns)) {
             return;
