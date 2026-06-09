@@ -67,6 +67,57 @@ if(VNLB_ENABLE_MARCH_NATIVE AND NOT MSVC)
   )
 endif()
 
+set(VNLB_HIGHWAY_PROVIDER)
+find_package(hwy CONFIG QUIET)
+if(TARGET hwy::hwy)
+  add_library(vnlb_highway INTERFACE)
+  get_target_property(_VNLB_HIGHWAY_INCLUDE_DIRS
+    hwy::hwy INTERFACE_INCLUDE_DIRECTORIES
+  )
+  if(_VNLB_HIGHWAY_INCLUDE_DIRS)
+    target_include_directories(vnlb_highway SYSTEM INTERFACE
+      ${_VNLB_HIGHWAY_INCLUDE_DIRS}
+    )
+  endif()
+
+  get_target_property(_VNLB_HIGHWAY_COMPILE_DEFINITIONS
+    hwy::hwy INTERFACE_COMPILE_DEFINITIONS
+  )
+  if(_VNLB_HIGHWAY_COMPILE_DEFINITIONS)
+    target_compile_definitions(vnlb_highway INTERFACE
+      ${_VNLB_HIGHWAY_COMPILE_DEFINITIONS}
+    )
+  endif()
+
+  get_target_property(_VNLB_HIGHWAY_COMPILE_FEATURES
+    hwy::hwy INTERFACE_COMPILE_FEATURES
+  )
+  if(_VNLB_HIGHWAY_COMPILE_FEATURES)
+    target_compile_features(vnlb_highway INTERFACE
+      ${_VNLB_HIGHWAY_COMPILE_FEATURES}
+    )
+  endif()
+
+  set(VNLB_HIGHWAY_PROVIDER "hwy::hwy")
+else()
+  find_path(VNLB_HIGHWAY_INCLUDE_DIR
+    NAMES hwy/highway.h
+  )
+  mark_as_advanced(VNLB_HIGHWAY_INCLUDE_DIR)
+  if(NOT VNLB_HIGHWAY_INCLUDE_DIR)
+    message(FATAL_ERROR
+      "Highway is required. Install the hwy package or set "
+      "VNLB_HIGHWAY_INCLUDE_DIR to a directory containing hwy/highway.h."
+    )
+  endif()
+
+  add_library(vnlb_highway INTERFACE)
+  target_include_directories(vnlb_highway SYSTEM INTERFACE
+    "${VNLB_HIGHWAY_INCLUDE_DIR}"
+  )
+  set(VNLB_HIGHWAY_PROVIDER "${VNLB_HIGHWAY_INCLUDE_DIR}")
+endif()
+
 function(vnlb_collect_openblas_roots out_var)
   set(_roots)
   foreach(_var IN ITEMS OpenBLAS_ROOT OPENBLAS_ROOT)
@@ -257,11 +308,6 @@ if(VNLB_ENABLE_LAPACK)
   endif()
 endif()
 
-set(VNLB_LINALG_USE_AARCH64_NEON OFF)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|AARCH64)$")
-  set(VNLB_LINALG_USE_AARCH64_NEON ON)
-endif()
-
 add_library(vnlb_linalg STATIC
   src/linalg/linalg.cpp
   ${VNLB_LINALG_BACKEND_SOURCE}
@@ -273,10 +319,10 @@ target_include_directories(vnlb_linalg
 target_link_libraries(vnlb_linalg
   PUBLIC
     vnlb_project_options
+    vnlb_highway
 )
 target_compile_definitions(vnlb_linalg
   PUBLIC
-    VNLB_LINALG_USE_AARCH64_NEON=$<BOOL:${VNLB_LINALG_USE_AARCH64_NEON}>
     VNLB_LINALG_USE_ACCELERATE=$<BOOL:${VNLB_LINALG_USE_ACCELERATE}>
     VNLB_LINALG_USE_OPENBLAS=$<BOOL:${VNLB_LINALG_USE_OPENBLAS}>
 )
@@ -317,11 +363,6 @@ set_target_properties(vnlb_aggregate PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
-set(VNLB_CORE_USE_AARCH64_NEON OFF)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|AARCH64)$")
-  set(VNLB_CORE_USE_AARCH64_NEON ON)
-endif()
-
 add_library(vnlb_core STATIC
   src/core/core.cpp
 )
@@ -335,10 +376,8 @@ target_link_libraries(vnlb_core
     vnlb_aggregate
     vnlb_flow
     vnlb_linalg
-)
-target_compile_definitions(vnlb_core
   PRIVATE
-    VNLB_CORE_USE_AARCH64_NEON=$<BOOL:${VNLB_CORE_USE_AARCH64_NEON}>
+    vnlb_highway
 )
 set_target_properties(vnlb_core PROPERTIES
   CXX_EXTENSIONS OFF
@@ -437,8 +476,7 @@ message(STATUS "  VNLB_ENABLE_ACCELERATE: ${VNLB_ENABLE_ACCELERATE}")
 message(STATUS "  VNLB_ENABLE_CBLAS: ${VNLB_ENABLE_CBLAS}")
 message(STATUS "  VNLB_USE_LTO: ${VNLB_USE_LTO}")
 message(STATUS "  VNLB_ENABLE_MARCH_NATIVE: ${VNLB_ENABLE_MARCH_NATIVE}")
+message(STATUS "  VNLB_HIGHWAY_PROVIDER: ${VNLB_HIGHWAY_PROVIDER}")
 message(STATUS "  VNLB_LINALG_BACKEND: ${VNLB_LINALG_BACKEND}")
 message(STATUS "  VNLB_LINALG_USE_ACCELERATE: ${VNLB_LINALG_USE_ACCELERATE}")
 message(STATUS "  VNLB_LINALG_USE_OPENBLAS: ${VNLB_LINALG_USE_OPENBLAS}")
-message(STATUS "  VNLB_LINALG_USE_AARCH64_NEON: ${VNLB_LINALG_USE_AARCH64_NEON}")
-message(STATUS "  VNLB_CORE_USE_AARCH64_NEON: ${VNLB_CORE_USE_AARCH64_NEON}")
