@@ -183,6 +183,7 @@ jobs:
         shell: bash
         run: |
           set -eu
+          mkdir -p build/deps
 
           python - <<'PY'
           from pathlib import Path
@@ -191,29 +192,30 @@ jobs:
 
           url = "https://github.com/google/highway/archive/refs/tags/1.4.0.tar.gz"
           expected = "e72241ac9524bb653ae52ced768b508045d4438726a303f10181a38f764a453c"
-          path = Path("/tmp/highway-1.4.0.tar.gz")
+          path = Path("build/deps/highway-1.4.0.tar.gz")
+          path.parent.mkdir(parents=True, exist_ok=True)
           urllib.request.urlretrieve(url, path)
           actual = hashlib.sha256(path.read_bytes()).hexdigest()
           if actual != expected:
               raise SystemExit(f"Highway sha256 mismatch: {actual}")
           PY
-          tar -xzf /tmp/highway-1.4.0.tar.gz -C /tmp
-          CC=gcc CXX=g++ cmake -S /tmp/highway-1.4.0 -B /tmp/highway-build -G Ninja \
+          tar -xzf build/deps/highway-1.4.0.tar.gz -C build/deps
+          CC=gcc CXX=g++ cmake -S build/deps/highway-1.4.0 -B build/deps/highway-build -G Ninja \
             -D CMAKE_BUILD_TYPE=Release \
             -D CMAKE_INSTALL_PREFIX=C:/highway \
             -D BUILD_SHARED_LIBS=OFF \
             -D HWY_ENABLE_EXAMPLES=OFF \
             -D HWY_ENABLE_TESTS=OFF
-          cmake --build /tmp/highway-build --target install
+          cmake --build build/deps/highway-build --target install
 
-          git clone --depth 1 --branch v0.3.33 https://github.com/OpenMathLib/OpenBLAS.git /tmp/OpenBLAS
-          make -C /tmp/OpenBLAS -j"${NUMBER_OF_PROCESSORS:-2}" \
+          git clone --depth 1 --branch v0.3.33 https://github.com/OpenMathLib/OpenBLAS.git build/deps/OpenBLAS
+          make -C build/deps/OpenBLAS -j"${NUMBER_OF_PROCESSORS:-2}" \
             TARGET=CORE2 \
             BINARY=64 \
             USE_THREAD=1 \
             USE_OPENMP=0 \
             NO_SHARED=0
-          make -C /tmp/OpenBLAS PREFIX=C:/openblas install
+          make -C build/deps/OpenBLAS PREFIX=C:/openblas install
 
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
