@@ -42,13 +42,15 @@ jobs:
             runner: windows-2022
             builder: direct
             wheel_path: wheelhouse/*.whl
-            build_environment: >-
+            build_environment: |
               CC=gcc
               CXX=g++
               CMAKE_GENERATOR=Ninja
               CMAKE_PREFIX_PATH=C:/msys64/mingw64
+              hwy_DIR=C:/msys64/mingw64/lib/cmake/hwy
+              OpenBLAS_DIR=C:/msys64/mingw64/lib/cmake/OpenBLAS
               OpenBLAS_ROOT=C:/msys64/mingw64
-              CMAKE_ARGS=-DVNLB_ENABLE_MARCH_NATIVE=OFF
+              CMAKE_ARGS=-DVNLB_ENABLE_MARCH_NATIVE=OFF -DCMAKE_PREFIX_PATH=C:/msys64/mingw64 -Dhwy_DIR=C:/msys64/mingw64/lib/cmake/hwy -DOpenBLAS_DIR=C:/msys64/mingw64/lib/cmake/OpenBLAS -DOpenBLAS_ROOT=C:/msys64/mingw64
           - name: linux-x64
             runner: ubuntu-24.04
             builder: cibuildwheel
@@ -133,7 +135,7 @@ jobs:
             runner: macos-26-intel
             builder: direct
             wheel_path: dist/*.whl
-            build_environment: >-
+            build_environment: |
               MACOSX_DEPLOYMENT_TARGET=12.0
               CMAKE_OSX_ARCHITECTURES=x86_64
               CMAKE_ARGS=-DVNLB_ENABLE_MARCH_NATIVE=OFF
@@ -141,7 +143,7 @@ jobs:
             runner: macos-26
             builder: direct
             wheel_path: dist/*.whl
-            build_environment: >-
+            build_environment: |
               MACOSX_DEPLOYMENT_TARGET=12.0
               CMAKE_OSX_ARCHITECTURES=arm64
               CMAKE_ARGS=-DVNLB_ENABLE_MARCH_NATIVE=OFF
@@ -191,7 +193,10 @@ jobs:
           if [[ "${RUNNER_OS}" == "Windows" ]]; then
             python -m pip install -U delvewheel
           fi
-          export ${BUILD_ENVIRONMENT}
+          while IFS= read -r assignment; do
+            [[ -z "${assignment}" ]] && continue
+            export "${assignment}"
+          done <<< "${BUILD_ENVIRONMENT}"
           python -m build --wheel
           if [[ "${RUNNER_OS}" == "Windows" ]]; then
             mkdir -p wheelhouse
