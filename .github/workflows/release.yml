@@ -46,11 +46,10 @@ jobs:
               CC=gcc
               CXX=g++
               CMAKE_GENERATOR=Ninja
-              CMAKE_PREFIX_PATH=C:/msys64/mingw64
-              hwy_DIR=C:/msys64/mingw64/lib/cmake/hwy
-              OpenBLAS_DIR=C:/msys64/mingw64/lib/cmake/OpenBLAS
-              OpenBLAS_ROOT=C:/msys64/mingw64
-              CMAKE_ARGS=-DVNLB_ENABLE_MARCH_NATIVE=OFF -DCMAKE_PREFIX_PATH=C:/msys64/mingw64 -Dhwy_DIR=C:/msys64/mingw64/lib/cmake/hwy -DOpenBLAS_DIR=C:/msys64/mingw64/lib/cmake/OpenBLAS -DOpenBLAS_ROOT=C:/msys64/mingw64
+              CMAKE_PREFIX_PATH=C:/highway;C:/openblas
+              hwy_DIR=C:/highway/lib/cmake/hwy
+              OpenBLAS_ROOT=C:/openblas
+              CMAKE_ARGS=-DVNLB_ENABLE_MARCH_NATIVE=OFF -DCMAKE_PREFIX_PATH=C:/highway;C:/openblas -Dhwy_DIR=C:/highway/lib/cmake/hwy -DOpenBLAS_ROOT=C:/openblas
           - name: linux-x64
             runner: ubuntu-24.04
             builder: cibuildwheel
@@ -163,19 +162,58 @@ jobs:
             mingw-w64-x86_64-toolchain
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-openblas
-            mingw-w64-x86_64-highway
+            make
+            perl
 
       - name: Add MSYS2 to PATH
         if: runner.os == 'Windows'
         shell: pwsh
-        run: echo "C:\msys64\mingw64\bin" >> $env:GITHUB_PATH
+        run: |
+          echo "C:\msys64\mingw64\bin" >> $env:GITHUB_PATH
+          echo "C:\msys64\usr\bin" >> $env:GITHUB_PATH
 
       - name: Setup Python
         if: matrix.builder == 'direct'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Build Windows dependencies
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -eu
+
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib
+          import urllib.request
+
+          url = "https://github.com/google/highway/archive/refs/tags/1.4.0.tar.gz"
+          expected = "e72241ac9524bb653ae52ced768b508045d4438726a303f10181a38f764a453c"
+          path = Path("/tmp/highway-1.4.0.tar.gz")
+          urllib.request.urlretrieve(url, path)
+          actual = hashlib.sha256(path.read_bytes()).hexdigest()
+          if actual != expected:
+              raise SystemExit(f"Highway sha256 mismatch: {actual}")
+          PY
+          tar -xzf /tmp/highway-1.4.0.tar.gz -C /tmp
+          CC=gcc CXX=g++ cmake -S /tmp/highway-1.4.0 -B /tmp/highway-build -G Ninja \
+            -D CMAKE_BUILD_TYPE=Release \
+            -D CMAKE_INSTALL_PREFIX=C:/highway \
+            -D BUILD_SHARED_LIBS=OFF \
+            -D HWY_ENABLE_EXAMPLES=OFF \
+            -D HWY_ENABLE_TESTS=OFF
+          cmake --build /tmp/highway-build --target install
+
+          git clone --depth 1 --branch v0.3.33 https://github.com/OpenMathLib/OpenBLAS.git /tmp/OpenBLAS
+          make -C /tmp/OpenBLAS -j"${NUMBER_OF_PROCESSORS:-2}" \
+            TARGET=CORE2 \
+            BINARY=64 \
+            USE_THREAD=1 \
+            USE_OPENMP=0 \
+            NO_SHARED=0
+          make -C /tmp/OpenBLAS PREFIX=C:/openblas install
 
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
@@ -200,7 +238,10 @@ jobs:
           python -m build --wheel
           if [[ "${RUNNER_OS}" == "Windows" ]]; then
             mkdir -p wheelhouse
-            python -m delvewheel repair --add-path C:/msys64/mingw64/bin -w wheelhouse dist/*.whl
+            python -m delvewheel repair \
+              --add-path C:/openblas/bin \
+              --add-path C:/msys64/mingw64/bin \
+              -w wheelhouse dist/*.whl
           fi
 
       - name: Build wheel with cibuildwheel
