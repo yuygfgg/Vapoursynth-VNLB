@@ -75,10 +75,10 @@ void clear_contributions(ContributionStackView stack)
     for (int channel = 0; channel < layout.channels; ++channel) {
         for (int slot = 0; slot < layout.slot_count; ++slot) {
             for (int y = 0; y < layout.height; ++y) {
-                for (int x = 0; x < layout.width; ++x) {
-                    stack.numerator(slot, channel, x, y) = 0.0F;
-                    stack.channel_weight(slot, channel, x, y) = 0.0F;
-                }
+                std::fill_n(stack.numerator_row(slot, channel, y), layout.width,
+                            0.0F);
+                std::fill_n(stack.channel_weight_row(slot, channel, y),
+                            layout.width, 0.0F);
             }
         }
     }

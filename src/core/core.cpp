@@ -64,15 +64,6 @@ void copy_float_row(const float* source, float* destination,
     }
 }
 
-void build_aggregation_window(StageWorkspace& workspace,
-                              StageParameters parameters) {
-    const int patch_dim =
-        parameters.patch_size * parameters.patch_size * parameters.patch_time;
-    workspace.aggregation_window_.resize(static_cast<std::size_t>(patch_dim));
-    std::fill(workspace.aggregation_window_.begin(),
-              workspace.aggregation_window_.end(), 1.0F);
-}
-
 [[nodiscard]] bool group_is_equal(const std::vector<float>& group, int channels,
                                   int patch_dim, int similar) {
     if (similar <= 1) {
@@ -248,10 +239,11 @@ void center_samples_with_mean(const linalg::Matrix<float>& samples,
         return false;
     }
 
-    for (std::size_t col = 0; col < samples.cols(); ++col) {
-        const float value = samples(0, col);
-        for (std::size_t row = 1; row < samples.rows(); ++row) {
-            if (samples(row, col) != value) {
+    const float* first = samples.row_data(0);
+    for (std::size_t row = 1; row < samples.rows(); ++row) {
+        const float* current = samples.row_data(row);
+        for (std::size_t col = 0; col < samples.cols(); ++col) {
+            if (current[col] != first[col]) {
                 return false;
             }
         }
@@ -518,11 +510,10 @@ void transform_vnlb_coupled(StageWorkspace& workspace, Stage stage, int similar,
 }
 
 void transform_vnlb_coupled_samples(StageWorkspace& workspace, Stage stage,
-                                    int similar, std::vector<float>& weights) {
+                                    int similar) {
     const int channels = workspace.geometry_.channels;
     const int patch_dim = workspace.patch_dim_;
     const int sample_dim = channels * patch_dim;
-    weights.assign(static_cast<std::size_t>(similar), 1.0F);
     workspace.output_sample_major_ = true;
 
     if (samples_are_equal(workspace.samples_noisy_.cview())) {
@@ -536,11 +527,9 @@ void transform_vnlb_coupled_samples(StageWorkspace& workspace, Stage stage,
     filter_vnlb_samples(workspace, stage, similar, sample_dim, flat_patch);
 }
 
-void transform_vnlb_group(StageWorkspace& workspace, Stage stage, int similar,
-                          std::vector<float>& weights) {
+void transform_vnlb_group(StageWorkspace& workspace, Stage stage, int similar) {
     const int channels = workspace.geometry_.channels;
     const int patch_dim = workspace.patch_dim_;
-    weights.assign(static_cast<std::size_t>(similar), 1.0F);
 
     if (group_is_equal(workspace.group_noisy_, channels, patch_dim, similar)) {
         return;
@@ -618,40 +607,32 @@ void initialize_frame_processing_mask(VideoGeometry geometry,
                                       int anchor_frame,
                                       std::vector<unsigned char>& mask) {
     (void)stage;
-    mask.assign(static_cast<std::size_t>(geometry.frames * geometry.width *
-                                         geometry.height),
-                0);
+    mask.assign(static_cast<std::size_t>(geometry.width * geometry.height), 0);
     const int max_x = geometry.width - parameters.patch_size;
     const int max_y = geometry.height - parameters.patch_size;
-    const int plane_pixels = geometry.width * geometry.height;
-    const int local_frame = geometry.local_frame(anchor_frame);
-    const int frame_base = local_frame * plane_pixels;
     for (int y = 0; y <= max_y; ++y) {
         for (int x = 0; x <= max_x; ++x) {
             if (reference_processing_mask_selected(geometry, parameters, stage,
                                                    anchor_frame, x, y)) {
-                mask[static_cast<std::size_t>(frame_base +
-                                              (y * geometry.width) + x)] = 1;
+                mask[static_cast<std::size_t>((y * geometry.width) + x)] = 1;
             }
         }
     }
 }
 
 void clear_processing_mask_position(std::vector<unsigned char>& mask,
-                                    VideoGeometry geometry, int frame, int x,
-                                    int y) noexcept {
-    if (frame < geometry.first_frame ||
-        frame >= geometry.first_frame + geometry.frames || x < 0 ||
-        x >= geometry.width || y < 0 || y >= geometry.height) {
+                                    VideoGeometry geometry, int anchor_frame,
+                                    int frame, int x, int y) noexcept {
+    if (frame != anchor_frame || x < 0 || x >= geometry.width || y < 0 ||
+        y >= geometry.height) {
         return;
     }
-    const int index =
-        (geometry.local_frame(frame) * geometry.width * geometry.height) +
-        (y * geometry.width) + x;
+    const int index = (y * geometry.width) + x;
     mask[static_cast<std::size_t>(index)] = 0;
 }
 
-void apply_frame_paste_mask(StageWorkspace& workspace, int similar) {
+void apply_frame_paste_mask(StageWorkspace& workspace, int anchor_frame,
+                            int similar) {
     const VideoGeometry geometry = workspace.geometry_;
     const int patch_size = workspace.parameters_.patch_size;
     std::vector<unsigned char>& mask = workspace.processing_mask_;
@@ -659,23 +640,23 @@ void apply_frame_paste_mask(StageWorkspace& workspace, int similar) {
         const PatchMatch match =
             workspace.matches_[static_cast<std::size_t>(patch)];
 
-        clear_processing_mask_position(mask, geometry, match.frame, match.x,
-                                       match.y);
+        clear_processing_mask_position(mask, geometry, anchor_frame,
+                                       match.frame, match.x, match.y);
         if (match.y > 2 * patch_size) {
-            clear_processing_mask_position(mask, geometry, match.frame, match.x,
-                                           match.y - 1);
+            clear_processing_mask_position(mask, geometry, anchor_frame,
+                                           match.frame, match.x, match.y - 1);
         }
         if (match.y < geometry.height - (2 * patch_size)) {
-            clear_processing_mask_position(mask, geometry, match.frame, match.x,
-                                           match.y + 1);
+            clear_processing_mask_position(mask, geometry, anchor_frame,
+                                           match.frame, match.x, match.y + 1);
         }
         if (match.x > 2 * patch_size) {
-            clear_processing_mask_position(mask, geometry, match.frame,
-                                           match.x - 1, match.y);
+            clear_processing_mask_position(mask, geometry, anchor_frame,
+                                           match.frame, match.x - 1, match.y);
         }
         if (match.x < geometry.width - (2 * patch_size)) {
-            clear_processing_mask_position(mask, geometry, match.frame,
-                                           match.x + 1, match.y);
+            clear_processing_mask_position(mask, geometry, anchor_frame,
+                                           match.frame, match.x + 1, match.y);
         }
     }
 }
@@ -1084,11 +1065,15 @@ void gather_basic_samples_coupled(ConstVideoView noisy,
                  frame_delta < workspace.parameters_.patch_time;
                  ++frame_delta) {
                 const int frame = match.frame + frame_delta;
+                const float* plane = noisy.plane_data(frame, channel);
+                const int stride = noisy.plane_stride(frame, channel);
                 for (int y = 0; y < patch_size; ++y) {
                     const int position =
                         patch_position(patch_size, 0, y, frame_delta);
                     const float* input_row =
-                        noisy.row_data(frame, channel, match.y + y, match.x);
+                        plane +
+                        (static_cast<std::ptrdiff_t>(match.y + y) * stride) +
+                        match.x;
                     copy_float_row(input_row, row + channel_base + position,
                                    patch_size);
                 }
@@ -1154,14 +1139,24 @@ void gather_final_samples_coupled(ConstVideoView noisy, ConstVideoView basic,
                  frame_delta < workspace.parameters_.patch_time;
                  ++frame_delta) {
                 const int frame = match.frame + frame_delta;
+                const float* noisy_plane = noisy.plane_data(frame, channel);
+                const int noisy_stride = noisy.plane_stride(frame, channel);
+                const float* basic_plane = basic.plane_data(frame, channel);
+                const int basic_stride = basic.plane_stride(frame, channel);
                 for (int y = 0; y < patch_size; ++y) {
                     const int position =
                         patch_position(patch_size, 0, y, frame_delta);
                     const int sample_position = channel_base + position;
                     const float* noisy_input_row =
-                        noisy.row_data(frame, channel, match.y + y, match.x);
+                        noisy_plane +
+                        (static_cast<std::ptrdiff_t>(match.y + y) *
+                         noisy_stride) +
+                        match.x;
                     const float* basic_input_row =
-                        basic.row_data(frame, channel, match.y + y, match.x);
+                        basic_plane +
+                        (static_cast<std::ptrdiff_t>(match.y + y) *
+                         basic_stride) +
+                        match.x;
                     copy_float_row(noisy_input_row, noisy_row + sample_position,
                                    patch_size);
                     copy_float_row(basic_input_row, basic_row + sample_position,
@@ -1173,7 +1168,7 @@ void gather_final_samples_coupled(ConstVideoView noisy, ConstVideoView basic,
 }
 
 void write_group_contributions(StageWorkspace& workspace, int anchor_frame,
-                               int similar, const std::vector<float>& weights,
+                               int similar,
                                aggregate::ContributionStackView stack) {
     const auto layout = stack.layout();
     const int channels = workspace.geometry_.channels;
@@ -1197,16 +1192,10 @@ void write_group_contributions(StageWorkspace& workspace, int anchor_frame,
                     const int output_x = match.x + x;
                     const int position =
                         patch_position(patch_size, x, y, frame_delta);
-                    const float contribution_weight =
-                        weights[static_cast<std::size_t>(patch)] *
-                        workspace.aggregation_window_[static_cast<std::size_t>(
-                            position)];
-                    stack.add_weight(slot, output_x, output_y,
-                                     contribution_weight);
+                    stack.add_weight(slot, output_x, output_y, 1.0F);
                     for (int channel = 0; channel < channels; ++channel) {
                         const int channel_base = channel * patch_dim * similar;
                         stack.numerator(slot, channel, output_x, output_y) +=
-                            contribution_weight *
                             group[static_cast<std::size_t>(
                                 channel_base + (position * similar) + patch)];
                     }
@@ -1218,7 +1207,7 @@ void write_group_contributions(StageWorkspace& workspace, int anchor_frame,
 
 void write_sample_contributions_coupled(
     StageWorkspace& workspace, int anchor_frame, int similar,
-    const std::vector<float>& weights, aggregate::ContributionStackView stack) {
+    aggregate::ContributionStackView stack) {
     const auto layout = stack.layout();
     const int channels = workspace.geometry_.channels;
     const int patch_size = workspace.parameters_.patch_size;
@@ -1230,7 +1219,6 @@ void write_sample_contributions_coupled(
         const PatchMatch match =
             workspace.matches_[static_cast<std::size_t>(patch)];
         const float* row = samples.row_data(static_cast<std::size_t>(patch));
-        const float patch_weight = weights[static_cast<std::size_t>(patch)];
         for (int frame_delta = 0;
              frame_delta < workspace.parameters_.patch_time; ++frame_delta) {
             const int output_offset = match.frame + frame_delta - anchor_frame;
@@ -1242,13 +1230,11 @@ void write_sample_contributions_coupled(
                 const int output_y = match.y + y;
                 const int position =
                     patch_position(patch_size, 0, y, frame_delta);
-                const float* window =
-                    workspace.aggregation_window_.data() + position;
                 if (!per_channel_weight) {
                     float* weight_row =
                         stack.weight_row(slot, output_y) + match.x;
                     for (int x = 0; x < patch_size; ++x) {
-                        weight_row[x] += patch_weight * window[x];
+                        weight_row[x] += 1.0F;
                     }
                 }
 
@@ -1263,11 +1249,9 @@ void write_sample_contributions_coupled(
                                                   match.x
                                             : nullptr;
                     for (int x = 0; x < patch_size; ++x) {
-                        const float contribution_weight =
-                            patch_weight * window[x];
-                        numerator_row[x] += contribution_weight * sample_row[x];
+                        numerator_row[x] += sample_row[x];
                         if (per_channel_weight) {
-                            weight_row[x] += contribution_weight;
+                            weight_row[x] += 1.0F;
                         }
                     }
                 }
@@ -1334,21 +1318,16 @@ process_anchor_impl(ConstVideoView noisy, ConstVideoView reference,
     }
     workspace.prepare(geometry, parameters, stage);
 
-    std::vector<float> weights;
-    weights.reserve(static_cast<std::size_t>(parameters.similar));
-
     const int max_x = geometry.width - parameters.patch_size;
     const int max_y = geometry.height - parameters.patch_size;
-    const int plane_pixels = geometry.width * geometry.height;
     initialize_frame_processing_mask(geometry, parameters, stage, anchor_frame,
                                      workspace.processing_mask_);
 
     ProcessStats stats{};
-    const int frame_base = geometry.local_frame(anchor_frame) * plane_pixels;
     for (int anchor_y = 0; anchor_y <= max_y; ++anchor_y) {
         for (int anchor_x = 0; anchor_x <= max_x; ++anchor_x) {
             if (workspace.processing_mask_[static_cast<std::size_t>(
-                    frame_base + (anchor_y * geometry.width) + anchor_x)] ==
+                    (anchor_y * geometry.width) + anchor_x)] ==
                 0) {
                 continue;
             }
@@ -1385,16 +1364,16 @@ process_anchor_impl(ConstVideoView noisy, ConstVideoView reference,
             }
 
             workspace.output_sample_major_ = false;
-            process_group(similar, weights);
+            process_group(similar);
             if (workspace.output_sample_major_) {
                 write_sample_contributions_coupled(
-                    workspace, anchor_frame, similar, weights, contributions);
+                    workspace, anchor_frame, similar, contributions);
             } else {
                 write_group_contributions(workspace, anchor_frame, similar,
-                                          weights, contributions);
+                                          contributions);
             }
             ++stats.groups;
-            apply_frame_paste_mask(workspace, similar);
+            apply_frame_paste_mask(workspace, anchor_frame, similar);
         }
     }
 
@@ -1524,9 +1503,6 @@ void StageWorkspace::prepare(VideoGeometry geometry, StageParameters parameters,
         std::max(parameters.similar,
                  parameters.search_window * parameters.search_window *
                      (parameters.search_bwd + parameters.search_fwd + 1));
-
-    build_aggregation_window(*this, parameters);
-
     const std::size_t group_capacity =
         static_cast<std::size_t>(geometry.channels * patch_dim_ * max_similar_);
     group_noisy_.resize(group_capacity);
@@ -1546,14 +1522,14 @@ ProcessStats process_basic_anchor_no_flow(
     return process_anchor_impl(
         noisy, ConstVideoView{}, anchor_frame, Stage::Basic, parameters,
         flow_provider, contributions, workspace,
-        [&](int similar, std::vector<float>& weights) {
+        [&](int similar) {
             if (parameters.couple_channels && noisy.geometry().channels > 1) {
                 gather_basic_samples_coupled(noisy, workspace, similar);
-                transform_vnlb_coupled_samples(workspace, Stage::Basic, similar,
-                                               weights);
+                transform_vnlb_coupled_samples(workspace, Stage::Basic,
+                                               similar);
             } else {
                 gather_basic_group(noisy, workspace, similar);
-                transform_vnlb_group(workspace, Stage::Basic, similar, weights);
+                transform_vnlb_group(workspace, Stage::Basic, similar);
             }
         });
 }
@@ -1565,14 +1541,14 @@ ProcessStats process_final_anchor_no_flow(
     return process_anchor_impl(
         noisy, basic, anchor_frame, Stage::Final, parameters, flow_provider,
         contributions, workspace,
-        [&](int similar, std::vector<float>& weights) {
+        [&](int similar) {
             if (parameters.couple_channels && noisy.geometry().channels > 1) {
                 gather_final_samples_coupled(noisy, basic, workspace, similar);
-                transform_vnlb_coupled_samples(workspace, Stage::Final, similar,
-                                               weights);
+                transform_vnlb_coupled_samples(workspace, Stage::Final,
+                                               similar);
             } else {
                 gather_final_group(noisy, basic, workspace, similar);
-                transform_vnlb_group(workspace, Stage::Final, similar, weights);
+                transform_vnlb_group(workspace, Stage::Final, similar);
             }
         });
 }
@@ -1584,14 +1560,14 @@ ProcessStats process_basic_anchor_mvtools(
     return process_anchor_impl(
         noisy, ConstVideoView{}, anchor_frame, Stage::Basic, parameters,
         flow_provider, contributions, workspace,
-        [&](int similar, std::vector<float>& weights) {
+        [&](int similar) {
             if (parameters.couple_channels && noisy.geometry().channels > 1) {
                 gather_basic_samples_coupled(noisy, workspace, similar);
-                transform_vnlb_coupled_samples(workspace, Stage::Basic, similar,
-                                               weights);
+                transform_vnlb_coupled_samples(workspace, Stage::Basic,
+                                               similar);
             } else {
                 gather_basic_group(noisy, workspace, similar);
-                transform_vnlb_group(workspace, Stage::Basic, similar, weights);
+                transform_vnlb_group(workspace, Stage::Basic, similar);
             }
         });
 }
@@ -1603,14 +1579,14 @@ ProcessStats process_final_anchor_mvtools(
     return process_anchor_impl(
         noisy, basic, anchor_frame, Stage::Final, parameters, flow_provider,
         contributions, workspace,
-        [&](int similar, std::vector<float>& weights) {
+        [&](int similar) {
             if (parameters.couple_channels && noisy.geometry().channels > 1) {
                 gather_final_samples_coupled(noisy, basic, workspace, similar);
-                transform_vnlb_coupled_samples(workspace, Stage::Final, similar,
-                                               weights);
+                transform_vnlb_coupled_samples(workspace, Stage::Final,
+                                               similar);
             } else {
                 gather_final_group(noisy, basic, workspace, similar);
-                transform_vnlb_group(workspace, Stage::Final, similar, weights);
+                transform_vnlb_group(workspace, Stage::Final, similar);
             }
         });
 }

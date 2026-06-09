@@ -66,7 +66,6 @@ class StageWorkspace {
     int estimator_dim_ = 0;
     int max_similar_ = 0;
 
-    std::vector<float> aggregation_window_;
     std::vector<float> reference_patch_;
     std::vector<float> group_noisy_;
     std::vector<float> group_basic_;
