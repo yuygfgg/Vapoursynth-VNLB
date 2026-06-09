@@ -215,13 +215,31 @@ jobs:
           cmake --install build/deps/highway-build
 
           git clone --depth 1 --branch v0.3.33 https://github.com/OpenMathLib/OpenBLAS.git build/deps/OpenBLAS
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("build/deps/OpenBLAS/Makefile.install")
+          old = 'PKGFILE="$(DESTDIR)$(OPENBLAS_PKGCONFIG_DIR)/$(LIBSONAMEBASE)$(SUFFIX64).pc"'
+          new = 'PKGFILE=$(DESTDIR)$(OPENBLAS_PKGCONFIG_DIR)/$(LIBSONAMEBASE)$(SUFFIX64).pc'
+          text = path.read_text()
+          count = text.count(old)
+          if count != 2:
+              raise SystemExit(f"expected 2 OpenBLAS PKGFILE assignments, found {count}")
+          path.write_text(text.replace(old, new))
+          PY
           make -C build/deps/OpenBLAS -j"${NUMBER_OF_PROCESSORS:-2}" \
             TARGET=CORE2 \
             BINARY=64 \
             USE_THREAD=1 \
             USE_OPENMP=0 \
             NO_SHARED=0
-          make -C build/deps/OpenBLAS PREFIX=C:/openblas install
+          make -C build/deps/OpenBLAS PREFIX=C:/openblas \
+            TARGET=CORE2 \
+            BINARY=64 \
+            USE_THREAD=1 \
+            USE_OPENMP=0 \
+            NO_SHARED=0 \
+            install
 
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
