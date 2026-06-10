@@ -213,6 +213,9 @@ parse_stage_parameters(const VSMap* in, const VSAPI* vsapi, Stage stage) {
         parameters.tau = 400.0F / kEightBitDistanceScale;
         parameters.variance_threshold = 1.7F;
         parameters.flat_areas = true;
+        parameters.weight_alpha = 1.0F;
+        parameters.weight_beta = 0.5F;
+        parameters.weight_gamma = 1.0F;
     }
 
     parameters.patch_size =
@@ -251,6 +254,16 @@ parse_stage_parameters(const VSMap* in, const VSAPI* vsapi, Stage stage) {
             map_get_optional_int(in, vsapi, "flat_areas",
                                  parameters.flat_areas ? 1 : 0) != 0;
     }
+    parameters.weight_alpha = map_get_optional_float(in, vsapi, "weight_alpha",
+                                                     parameters.weight_alpha);
+    parameters.weight_beta = map_get_optional_float(in, vsapi, "weight_beta",
+                                                    parameters.weight_beta);
+    parameters.weight_gamma = map_get_optional_float(in, vsapi, "weight_gamma",
+                                                     parameters.weight_gamma);
+    parameters.weight_epsilon = map_get_optional_float(
+        in, vsapi, "weight_epsilon", parameters.weight_epsilon);
+    parameters.membership_noise_floor = map_get_optional_float(
+        in, vsapi, "membership_noise_floor", parameters.membership_noise_floor);
     parameters.couple_channels =
         map_get_optional_int(in, vsapi, "chroma",
                              parameters.couple_channels ? 1 : 0) != 0;
@@ -868,7 +881,8 @@ void VS_CC VAggregateCreate(const VSMap* in, VSMap* out,
         if (data->patch_time <= 0 || data->search_bwd < 0 ||
             data->search_fwd < 0) {
             throw std::invalid_argument(
-                "invalid Aggregate temporal parameters");
+                "patch_time must be positive and search_bwd/search_fwd must be "
+                "non-negative");
         }
 
         data->slot_count =
@@ -928,7 +942,10 @@ VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
         "radius:int:opt;search_bwd:int:opt;search_fwd:int:opt;"
         "rank:int:opt;cap_factor:float:opt;model_cap_factor:float:opt;"
         "beta:float:opt;tau:float:opt;variance_threshold:float:opt;"
-        "chroma:int:opt;mvfw:vnode:opt;mvbw:vnode:opt;";
+        "weight_alpha:float:opt;weight_beta:float:opt;"
+        "weight_gamma:float:opt;weight_epsilon:float:opt;"
+        "membership_noise_floor:float:opt;chroma:int:opt;"
+        "mvfw:vnode:opt;mvbw:vnode:opt;";
     vspapi->registerFunction("Basic", basic_args, "clip:vnode;", BasicCreate,
                              nullptr, plugin);
 
@@ -939,8 +956,10 @@ VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
         "search_fwd:int:opt;rank:int:opt;cap_factor:float:opt;"
         "model_cap_factor:float:opt;beta:float:opt;tau:float:opt;"
         "variance_threshold:float:opt;sigma_basic:float:opt;"
-        "gamma:float:opt;flat_areas:int:opt;chroma:int:opt;"
-        "mvfw:vnode:opt;mvbw:vnode:opt;";
+        "gamma:float:opt;flat_areas:int:opt;weight_alpha:float:opt;"
+        "weight_beta:float:opt;weight_gamma:float:opt;"
+        "weight_epsilon:float:opt;membership_noise_floor:float:opt;"
+        "chroma:int:opt;mvfw:vnode:opt;mvbw:vnode:opt;";
     vspapi->registerFunction("Final", final_args, "clip:vnode;", FinalCreate,
                              nullptr, plugin);
 

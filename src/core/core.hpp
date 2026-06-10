@@ -30,6 +30,11 @@ struct StageParameters {
     float variance_threshold = 1.1F;
     float sigma_basic = 0.0F;
     float gamma = 0.95F;
+    float weight_alpha = 0.75F;
+    float weight_beta = 0.35F;
+    float weight_gamma = 1.0F;
+    float weight_epsilon = 1.0e-6F;
+    float membership_noise_floor = 0.25F;
     int proc_step = 8;
     bool aggregation_window = false;
     bool order_invariance = false;
@@ -89,6 +94,11 @@ class StageWorkspace {
     std::vector<int> distance_plane_strides_;
     std::vector<int> scheduled_frames_;
     std::vector<unsigned char> processing_mask_;
+    std::vector<float> aggregation_log_patch_weights_;
+    std::vector<float> aggregation_patch_weights_;
+    std::vector<float> aggregation_scores_;
+    std::vector<float> aggregation_window_weights_;
+    int aggregation_weight_model_count_ = 0;
     bool output_sample_major_ = false;
 };
 

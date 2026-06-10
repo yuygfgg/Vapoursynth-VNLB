@@ -2,6 +2,7 @@
 #include "core/core.hpp"
 #include "flow/flow.hpp"
 
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <span>
@@ -94,6 +95,16 @@ void test_stage_parameter_defaults() {
     require(parameters.proc_step == 8, "default block step");
     require(parameters.couple_channels, "default coupled chroma");
     require_close(parameters.tau, 0.0F, 1.0e-9F, "default tau");
+    require_close(parameters.weight_alpha, 0.75F, 1.0e-6F,
+                  "default weight alpha");
+    require_close(parameters.weight_beta, 0.35F, 1.0e-6F,
+                  "default weight beta");
+    require_close(parameters.weight_gamma, 1.0F, 1.0e-6F,
+                  "default weight gamma");
+    require_close(parameters.weight_epsilon, 1.0e-6F, 1.0e-12F,
+                  "default weight epsilon");
+    require_close(parameters.membership_noise_floor, 0.25F, 1.0e-6F,
+                  "default membership noise floor");
 }
 
 vnlb::core::StageParameters constant_test_parameters() {
@@ -168,6 +179,21 @@ void require_constant_video(vnlb::core::ConstVideoView video, float expected) {
     }
 }
 
+void require_finite_video(vnlb::core::ConstVideoView video,
+                          std::string_view label) {
+    const auto geometry = video.geometry();
+    for (int frame = 0; frame < geometry.frames; ++frame) {
+        for (int channel = 0; channel < geometry.channels; ++channel) {
+            for (int y = 0; y < geometry.height; ++y) {
+                for (int x = 0; x < geometry.width; ++x) {
+                    require(std::isfinite(video.sample(x, y, frame, channel)),
+                            label);
+                }
+            }
+        }
+    }
+}
+
 void test_basic_constant_pipeline() {
     const vnlb::core::VideoGeometry geometry{5, 5, 3, 1};
     vnlb::core::VideoBuffer noisy(geometry, 0.25F);
@@ -208,6 +234,37 @@ void test_final_constant_pipeline() {
     require_constant_video(output.cview(), 0.25F);
 }
 
+void test_basic_weighted_gradient_pipeline() {
+    const vnlb::core::VideoGeometry geometry{5, 5, 3, 1};
+    vnlb::core::VideoBuffer noisy(geometry, 0.0F);
+    auto noisy_view = noisy.view();
+    for (int frame = 0; frame < geometry.frames; ++frame) {
+        for (int y = 0; y < geometry.height; ++y) {
+            for (int x = 0; x < geometry.width; ++x) {
+                noisy_view.sample(x, y, frame) =
+                    0.05F * static_cast<float>(x) +
+                    0.03F * static_cast<float>(y) +
+                    0.01F * static_cast<float>(frame);
+            }
+        }
+    }
+
+    vnlb::core::VideoBuffer output(geometry, 0.0F);
+    auto parameters = constant_test_parameters();
+
+    run_constant_pipeline(
+        [&](int frame, const vnlb::flow::SameLocationProvider& flow_provider,
+            vnlb::aggregate::ContributionStackView stack,
+            vnlb::core::StageWorkspace& workspace) {
+            return vnlb::core::process_basic_anchor_no_flow(
+                noisy.cview(), frame, parameters, flow_provider, stack,
+                workspace);
+        },
+        noisy.cview(), output.view(), parameters);
+
+    require_finite_video(output.cview(), "weighted gradient output");
+}
+
 } // namespace
 
 int main() {
@@ -217,5 +274,6 @@ int main() {
     test_stage_parameter_defaults();
     test_basic_constant_pipeline();
     test_final_constant_pipeline();
+    test_basic_weighted_gradient_pipeline();
     return EXIT_SUCCESS;
 }

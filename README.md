@@ -30,7 +30,7 @@ pip install -U vapoursynth-vnlb
 This basic estimate produces a decent estimate of the noise-free image, as a reference for the final estimate.
 
 ```python
-vnlb.Basic(clip clip, float sigma[, int block_size=8, int block_step=8, int group_size=8, float cap_factor=4.0, float model_cap_factor=1.0, int bm_range=9, int patch_time=1, int radius=1, int search_bwd=1, int search_fwd=1, int rank=8, float beta=1.0, float tau=0.0, float variance_threshold=1.1, int chroma=1, clip mvfw=None, clip mvbw=None])
+vnlb.Basic(clip clip, float sigma[, int block_size=8, int block_step=8, int group_size=8, float cap_factor=4.0, float model_cap_factor=1.0, int bm_range=9, int patch_time=1, int radius=1, int search_bwd=1, int search_fwd=1, int rank=8, float beta=1.0, float tau=0.0, float variance_threshold=1.1, float weight_alpha=0.75, float weight_beta=0.35, float weight_gamma=1.0, float weight_epsilon=1e-6, float membership_noise_floor=0.25, int chroma=1, clip mvfw=None, clip mvbw=None])
 ```
 
 - clip:
@@ -78,6 +78,69 @@ vnlb.Basic(clip clip, float sigma[, int block_size=8, int block_step=8, int grou
 - variance_threshold:
     Dimensionless cutoff applied to the internal normalized noise variance. Components below `variance_threshold * beta * sigma^2` are discarded. Higher values usually smooth more.
 
+- weight_alpha:
+    Strength of group-confidence weighting during aggregation. Higher values give more influence to groups whose Bayesian model is more confident, usually reducing weak-match blur and improving stable detail. Too high can over-favor very smooth or very confident groups and suppress subtle texture. Set `0.0` to disable this term.
+
+- weight_beta:
+    Strength of patch membership weighting during aggregation. Higher values reject patches that fit the current group poorly, which can reduce bad temporal matches and texture smearing. Too high can make aggregation too selective, leaving more residual noise or a slightly patchy look. Set `0.0` to disable this term.
+
+- weight_gamma:
+    Strength of the spatial patch aggregation window. Higher values favor patch centers over patch borders, usually reducing blocking or grid-like artifacts. Too high can make overlapping patches contribute less evenly. Set `0.0` to disable the window.
+
+- weight_epsilon:
+    Stabilizer for group-confidence weighting. Most users should leave it as default.
+
+- membership_noise_floor:
+    Noise tolerance floor for patch membership weighting. Higher values make membership weighting less strict, allowing more averaging and smoother output. Lower values make it stricter, which can reject bad matches more aggressively but may leave more noise or uneven aggregation. Most users should leave it as default.
+
+> [!NOTE]
+>   Formula reference:
+>
+>   $$
+    w_{k,i,u}
+    =
+    \tau_k^{-\alpha}
+    \cdot
+    \exp(-\beta M_{k,i})
+    \cdot
+    a(u)^\gamma
+    $$
+>
+>   where `weight_alpha`, `weight_beta`, and `weight_gamma` are $\alpha$, $\beta$, and $\gamma$. 
+> 
+> The group precision term is:
+>
+>   $$
+    \tau_k
+    =
+    \varepsilon
+    + \frac{d}{n_{\mathrm{eff},k}}
+    + \sum_j
+      \frac{\lambda_{k,j}}{\lambda_{k,j}+\sigma_{\mathrm{est}}^2}
+    $$
+>
+>    The membership penalty is:
+>
+>   $$
+    M_{k,i}
+    =
+    \max(0, Z_{k,i}-Z_{k,\mathrm{ref}})
+    + \frac{1}{d_m}
+      \sum_j \log\left(1+\frac{\lambda_{k,j}}{\sigma_{\mathrm{eff}}^2}\right)
+    $$
+>
+>    with:
+>
+>    $$
+    Z_{k,i}
+    =
+    \frac{D_{k,i}-d_m}{\sqrt{2d_m}},
+    \qquad
+    Z_{k,\mathrm{ref}}
+    =
+    \min_i Z_{k,i}
+    $$
+
 - chroma:
     Defaults to `1`. For `YUV444PS`, `chroma=1` estimates one coupled multi-channel model across Y, U, and V. Use `chroma=0` to process planes independently. `GrayS` clips ignore this setting.
 
@@ -108,7 +171,7 @@ vnlb.Final(clip clip, clip ref, float sigma[, ...])
     Enables the flat-area path. Can improve very flat regions, but may smooth low-contrast texture. Final defaults to `1`.
 
 - *Other parameters*:
-    Same as those in vnlb.Basic. Final uses different defaults for `tau=400.0` and `variance_threshold=1.7`.
+    Same as those in vnlb.Basic. Final uses different defaults for `tau=400.0`, `variance_threshold=1.7`, `weight_alpha=1.0`, and `weight_beta=0.5`.
 
 #### aggregation of VNLB denoising filter
 

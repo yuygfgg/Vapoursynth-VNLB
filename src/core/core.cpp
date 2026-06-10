@@ -32,7 +32,8 @@ void require(bool condition, const char* message) {
            lhs.similar_cap_factor == rhs.similar_cap_factor &&
            lhs.model_cap_factor == rhs.model_cap_factor &&
            lhs.couple_channels == rhs.couple_channels &&
-           lhs.aggregation_window == rhs.aggregation_window;
+           lhs.aggregation_window == rhs.aggregation_window &&
+           lhs.weight_gamma == rhs.weight_gamma;
 }
 
 [[nodiscard]] int normalized_proc_step(Stage stage,
@@ -117,6 +118,241 @@ void copy_float_row(const float* VNLB_RESTRICT source,
     const float cap = std::ceil(static_cast<float>(parameters.similar) *
                                 parameters.model_cap_factor);
     return std::max(parameters.similar, static_cast<int>(cap));
+}
+
+[[nodiscard]] bool
+aggregation_weights_enabled(StageParameters parameters) noexcept {
+    return parameters.weight_alpha != 0.0F || parameters.weight_beta != 0.0F ||
+           parameters.weight_gamma != 0.0F;
+}
+
+[[nodiscard]] float positive_or_zero(float value) noexcept {
+    return value > 0.0F ? value : 0.0F;
+}
+
+[[nodiscard]] float safe_log_weight_exp(float value) noexcept {
+    constexpr float min_log_weight = -80.0F;
+    constexpr float max_log_weight = 80.0F;
+    return std::exp(std::clamp(value, min_log_weight, max_log_weight));
+}
+
+[[nodiscard]] float signal_eigenvalue(float observed_eigenvalue,
+                                      float model_noise2) noexcept {
+    return positive_or_zero(observed_eigenvalue - model_noise2);
+}
+
+[[nodiscard]] float model_noise_variance(StageParameters parameters,
+                                         Stage stage) noexcept {
+    if (stage == Stage::Final) {
+        return parameters.beta * parameters.sigma_basic *
+               parameters.sigma_basic;
+    }
+    return parameters.beta * parameters.sigma * parameters.sigma;
+}
+
+[[nodiscard]] float
+estimate_noise_variance(StageParameters parameters) noexcept {
+    return parameters.beta * parameters.sigma * parameters.sigma;
+}
+
+[[nodiscard]] float membership_noise_variance(StageParameters parameters,
+                                              Stage stage) noexcept {
+    const float match_sigma =
+        stage == Stage::Final ? parameters.sigma_basic : parameters.sigma;
+    const float match_noise2 = match_sigma * match_sigma;
+    const float floor_noise2 =
+        parameters.membership_noise_floor * parameters.sigma * parameters.sigma;
+    return std::max(match_noise2, floor_noise2);
+}
+
+[[nodiscard]] float group_precision_tau(StageParameters parameters, Stage stage,
+                                        std::span<const float> eigenvalues,
+                                        int rank, int sample_dim,
+                                        int basis_similar) noexcept {
+    const float model_noise2 = model_noise_variance(parameters, stage);
+    const float estimate_noise2 = estimate_noise_variance(parameters);
+    float trace = 0.0F;
+    for (int component = 0; component < rank; ++component) {
+        const float lambda = signal_eigenvalue(
+            eigenvalues[static_cast<std::size_t>(component)], model_noise2);
+        if (lambda > 0.0F) {
+            trace += lambda / (lambda + estimate_noise2);
+        }
+    }
+
+    const float mean_term =
+        static_cast<float>(sample_dim) / static_cast<float>(basis_similar);
+    return parameters.weight_epsilon + mean_term + trace;
+}
+
+void reset_aggregation_weights(StageWorkspace& workspace, int similar) {
+    workspace.aggregation_log_patch_weights_.assign(
+        static_cast<std::size_t>(similar), 0.0F);
+    workspace.aggregation_patch_weights_.assign(
+        static_cast<std::size_t>(similar), 1.0F);
+    workspace.aggregation_scores_.assign(static_cast<std::size_t>(similar),
+                                         0.0F);
+    workspace.aggregation_weight_model_count_ = 0;
+}
+
+void accumulate_default_aggregation_model(StageWorkspace& workspace,
+                                          int similar) {
+    const StageParameters parameters = workspace.parameters_;
+    const int channels = workspace.geometry_.channels;
+    const int sample_dim =
+        workspace.patch_dim_ *
+        (parameters.couple_channels && channels > 1 ? channels : 1);
+    const int basis_similar = std::min(similar, model_similar_cap(parameters));
+    const float tau =
+        parameters.weight_epsilon +
+        (static_cast<float>(sample_dim) / static_cast<float>(basis_similar));
+    const float log_group_weight =
+        parameters.weight_alpha == 0.0F
+            ? 0.0F
+            : -parameters.weight_alpha * std::log(tau);
+    for (int patch = 0; patch < similar; ++patch) {
+        workspace
+            .aggregation_log_patch_weights_[static_cast<std::size_t>(patch)] +=
+            log_group_weight;
+    }
+    ++workspace.aggregation_weight_model_count_;
+}
+
+void finalize_aggregation_weights(StageWorkspace& workspace, int similar) {
+    if (!aggregation_weights_enabled(workspace.parameters_)) {
+        std::fill_n(workspace.aggregation_patch_weights_.begin(),
+                    static_cast<std::size_t>(similar), 1.0F);
+        return;
+    }
+
+    if (workspace.aggregation_weight_model_count_ == 0) {
+        accumulate_default_aggregation_model(workspace, similar);
+    }
+
+    const float inv_models =
+        1.0F / static_cast<float>(workspace.aggregation_weight_model_count_);
+    for (int patch = 0; patch < similar; ++patch) {
+        const std::size_t index = static_cast<std::size_t>(patch);
+        workspace.aggregation_patch_weights_[index] = safe_log_weight_exp(
+            workspace.aggregation_log_patch_weights_[index] * inv_models);
+    }
+}
+
+void prepare_aggregation_window(StageWorkspace& workspace) {
+    const int patch_size = workspace.parameters_.patch_size;
+    const float gamma = workspace.parameters_.weight_gamma;
+    workspace.aggregation_window_weights_.assign(
+        static_cast<std::size_t>(patch_size * patch_size), 1.0F);
+    if (gamma == 0.0F || patch_size <= 1) {
+        return;
+    }
+
+    const float center = 0.5F * static_cast<float>(patch_size - 1);
+    const float radius = std::max(center, 0.5F);
+    float max_weight = 0.0F;
+    for (int y = 0; y < patch_size; ++y) {
+        const float dy = (static_cast<float>(y) - center) / radius;
+        for (int x = 0; x < patch_size; ++x) {
+            const float dx = (static_cast<float>(x) - center) / radius;
+            const float raw = std::exp(-0.5F * ((dx * dx) + (dy * dy)));
+            const std::size_t index =
+                static_cast<std::size_t>((y * patch_size) + x);
+            workspace.aggregation_window_weights_[index] = raw;
+            max_weight = std::max(max_weight, raw);
+        }
+    }
+
+    const float inv_max = max_weight > 0.0F ? 1.0F / max_weight : 1.0F;
+    for (float& value : workspace.aggregation_window_weights_) {
+        value = std::pow(value * inv_max, gamma);
+    }
+}
+
+void accumulate_aggregation_model(StageWorkspace& workspace, Stage stage,
+                                  linalg::ConstMatrixView<float> centered,
+                                  std::span<const float> eigenvalues, int rank,
+                                  int basis_similar) {
+    const StageParameters parameters = workspace.parameters_;
+    if (parameters.weight_alpha == 0.0F && parameters.weight_beta == 0.0F) {
+        ++workspace.aggregation_weight_model_count_;
+        return;
+    }
+
+    const int similar = static_cast<int>(centered.rows());
+    const int sample_dim = static_cast<int>(centered.cols());
+    const float tau = group_precision_tau(parameters, stage, eigenvalues, rank,
+                                          sample_dim, basis_similar);
+    const float log_group_weight =
+        parameters.weight_alpha == 0.0F
+            ? 0.0F
+            : -parameters.weight_alpha * std::log(tau);
+
+    float volume = 0.0F;
+    if (parameters.weight_beta != 0.0F) {
+        const float model_noise2 = model_noise_variance(parameters, stage);
+        const float membership_noise2 =
+            membership_noise_variance(parameters, stage);
+        for (int component = 0; component < rank; ++component) {
+            const float lambda = signal_eigenvalue(
+                eigenvalues[static_cast<std::size_t>(component)], model_noise2);
+            if (lambda > 0.0F) {
+                volume += std::log1p(lambda / membership_noise2);
+            }
+        }
+        volume /= static_cast<float>(sample_dim);
+
+        float min_score = std::numeric_limits<float>::infinity();
+        const float score_scale =
+            std::sqrt(2.0F * static_cast<float>(sample_dim));
+        for (int patch = 0; patch < similar; ++patch) {
+            const float* VNLB_RESTRICT row =
+                centered.row_data(static_cast<std::size_t>(patch));
+            const float norm2 = linalg::kernels::dot_contiguous_highway(
+                row, row, static_cast<std::size_t>(sample_dim));
+            float distance = 0.0F;
+            float projected_norm2 = 0.0F;
+            for (int component = 0; component < rank; ++component) {
+                const float* VNLB_RESTRICT basis =
+                    workspace.eigenvectors_.row_data(
+                        static_cast<std::size_t>(component));
+                const float projection =
+                    linalg::kernels::dot_contiguous_highway(
+                        row, basis, static_cast<std::size_t>(sample_dim));
+                const float projection2 = projection * projection;
+                const float lambda = signal_eigenvalue(
+                    eigenvalues[static_cast<std::size_t>(component)],
+                    model_noise2);
+                distance += projection2 / (lambda + membership_noise2);
+                projected_norm2 += projection2;
+            }
+            const float residual_norm2 =
+                positive_or_zero(norm2 - projected_norm2);
+            distance += residual_norm2 / membership_noise2;
+
+            const float score =
+                (distance - static_cast<float>(sample_dim)) / score_scale;
+            workspace.aggregation_scores_[static_cast<std::size_t>(patch)] =
+                score;
+            min_score = std::min(min_score, score);
+        }
+
+        for (int patch = 0; patch < similar; ++patch) {
+            const std::size_t index = static_cast<std::size_t>(patch);
+            const float membership =
+                positive_or_zero(workspace.aggregation_scores_[index] -
+                                 min_score) +
+                volume;
+            workspace.aggregation_log_patch_weights_[index] +=
+                log_group_weight - (parameters.weight_beta * membership);
+        }
+    } else {
+        for (int patch = 0; patch < similar; ++patch) {
+            workspace.aggregation_log_patch_weights_[static_cast<std::size_t>(
+                patch)] += log_group_weight;
+        }
+    }
+
+    ++workspace.aggregation_weight_model_count_;
 }
 
 [[nodiscard]] linalg::ConstMatrixView<float>
@@ -363,7 +599,7 @@ void filter_vnlb_samples(StageWorkspace& workspace, Stage stage, int similar,
         std::min(similar, model_similar_cap(workspace.parameters_));
     if (basis_similar < std::min(sample_dim, rank)) {
         throw std::runtime_error(
-            "insufficient similar patches for VNLB rank and patch dimension");
+            "group_size must cover the effective VNLB rank");
     }
 
     auto mean_noisy = std::span<float>(workspace.mean_noisy_.data(),
@@ -422,6 +658,12 @@ void filter_vnlb_samples(StageWorkspace& workspace, Stage stage, int similar,
             std::copy(center.begin(), center.end(),
                       workspace.filtered_.row_data(row));
         }
+        const linalg::ConstMatrixView<float> membership_centered =
+            stage == Stage::Final ? workspace.centered_basic_.cview()
+                                  : workspace.centered_noisy_.cview();
+        accumulate_aggregation_model(workspace, stage, membership_centered,
+                                     std::span<const float>{}, rank,
+                                     basis_similar);
         return;
     }
 
@@ -467,9 +709,15 @@ void filter_vnlb_samples(StageWorkspace& workspace, Stage stage, int similar,
                                      workspace.eigen_workspace_);
     }
 
-    compute_filter_coefficients(
-        workspace, stage,
-        std::span<const float>(eigenvalues.data(), eigenvalues.size()), rank);
+    const auto eigenvalue_span =
+        std::span<const float>(eigenvalues.data(), eigenvalues.size());
+    compute_filter_coefficients(workspace, stage, eigenvalue_span, rank);
+
+    const linalg::ConstMatrixView<float> membership_centered =
+        stage == Stage::Final ? workspace.centered_basic_.cview()
+                              : workspace.centered_noisy_.cview();
+    accumulate_aggregation_model(workspace, stage, membership_centered,
+                                 eigenvalue_span, rank, basis_similar);
 
     const auto center = (stage == Stage::Final && flat_patch)
                             ? std::span<const float>(mean_basic)
@@ -1293,6 +1541,9 @@ void write_group_contributions(StageWorkspace& workspace, int anchor_frame,
     for (int patch = 0; patch < similar; ++patch) {
         const PatchMatch match =
             workspace.matches_[static_cast<std::size_t>(patch)];
+        const float patch_weight =
+            workspace
+                .aggregation_patch_weights_[static_cast<std::size_t>(patch)];
         for (int frame_delta = 0;
              frame_delta < workspace.parameters_.patch_time; ++frame_delta) {
             const int output_offset = match.frame + frame_delta - anchor_frame;
@@ -1306,10 +1557,17 @@ void write_group_contributions(StageWorkspace& workspace, int anchor_frame,
                     const int output_x = match.x + x;
                     const int position =
                         patch_position(patch_size, x, y, frame_delta);
-                    stack.add_weight(slot, output_x, output_y, 1.0F);
+                    const std::size_t window_index =
+                        static_cast<std::size_t>((y * patch_size) + x);
+                    const float contribution_weight =
+                        patch_weight *
+                        workspace.aggregation_window_weights_[window_index];
+                    stack.add_weight(slot, output_x, output_y,
+                                     contribution_weight);
                     for (int channel = 0; channel < channels; ++channel) {
                         const int channel_base = channel * patch_dim * similar;
                         stack.numerator(slot, channel, output_x, output_y) +=
+                            contribution_weight *
                             group[static_cast<std::size_t>(
                                 channel_base + (position * similar) + patch)];
                     }
@@ -1330,10 +1588,14 @@ void write_sample_contributions_coupled_contiguous(
     const int slot_stride = layout.slot_stride();
     const int weight_plane = channels * plane_pixels;
     const auto count = static_cast<std::size_t>(patch_size);
+    const bool windowed = workspace.parameters_.weight_gamma != 0.0F;
 
     for (int patch = 0; patch < similar; ++patch) {
         const PatchMatch match =
             workspace.matches_[static_cast<std::size_t>(patch)];
+        const float patch_weight =
+            workspace
+                .aggregation_patch_weights_[static_cast<std::size_t>(patch)];
         const float* VNLB_RESTRICT row =
             samples.row_data(static_cast<std::size_t>(patch));
         for (int frame_delta = 0;
@@ -1350,8 +1612,6 @@ void write_sample_contributions_coupled_contiguous(
                 const int row_offset = (output_y * layout.width) + match.x;
                 float* VNLB_RESTRICT weight_row =
                     data + (slot * slot_stride) + weight_plane + row_offset;
-                linalg::kernels::add_scalar_contiguous_highway(weight_row, 1.0F,
-                                                               count);
 
                 for (int channel = 0; channel < channels; ++channel) {
                     const float* VNLB_RESTRICT sample_row =
@@ -1359,8 +1619,34 @@ void write_sample_contributions_coupled_contiguous(
                     float* VNLB_RESTRICT numerator_row =
                         data + (slot * slot_stride) + (channel * plane_pixels) +
                         row_offset;
-                    linalg::kernels::add_contiguous_highway(numerator_row,
-                                                            sample_row, count);
+                    if (!windowed) {
+                        linalg::kernels::add_scaled_contiguous_highway(
+                            numerator_row, sample_row, patch_weight, count);
+                    } else {
+                        for (int x = 0; x < patch_size; ++x) {
+                            const std::size_t window_index =
+                                static_cast<std::size_t>((y * patch_size) + x);
+                            const float contribution_weight =
+                                patch_weight *
+                                workspace
+                                    .aggregation_window_weights_[window_index];
+                            numerator_row[x] +=
+                                contribution_weight * sample_row[x];
+                        }
+                    }
+                }
+
+                if (!windowed) {
+                    linalg::kernels::add_scalar_contiguous_highway(
+                        weight_row, patch_weight, count);
+                } else {
+                    for (int x = 0; x < patch_size; ++x) {
+                        const std::size_t window_index =
+                            static_cast<std::size_t>((y * patch_size) + x);
+                        weight_row[x] +=
+                            patch_weight *
+                            workspace.aggregation_window_weights_[window_index];
+                    }
                 }
             }
         }
@@ -1376,10 +1662,14 @@ void write_sample_contributions_coupled_planes(
     const int patch_dim = workspace.patch_dim_;
     const linalg::Matrix<float>& samples = workspace.filtered_;
     const auto count = static_cast<std::size_t>(patch_size);
+    const bool windowed = workspace.parameters_.weight_gamma != 0.0F;
 
     for (int patch = 0; patch < similar; ++patch) {
         const PatchMatch match =
             workspace.matches_[static_cast<std::size_t>(patch)];
+        const float patch_weight =
+            workspace
+                .aggregation_patch_weights_[static_cast<std::size_t>(patch)];
         const float* VNLB_RESTRICT row =
             samples.row_data(static_cast<std::size_t>(patch));
         for (int frame_delta = 0;
@@ -1410,9 +1700,23 @@ void write_sample_contributions_coupled_planes(
                         (static_cast<std::ptrdiff_t>(weight_row) *
                          plane.stride) +
                         match.x;
-                    linalg::kernels::
-                        add_contiguous_and_scalar_contiguous_highway(
-                            numerator, weight, sample_row, 1.0F, count);
+                    if (!windowed) {
+                        linalg::kernels::add_scaled_contiguous_highway(
+                            numerator, sample_row, patch_weight, count);
+                        linalg::kernels::add_scalar_contiguous_highway(
+                            weight, patch_weight, count);
+                    } else {
+                        for (int x = 0; x < patch_size; ++x) {
+                            const std::size_t window_index =
+                                static_cast<std::size_t>((y * patch_size) + x);
+                            const float contribution_weight =
+                                patch_weight *
+                                workspace
+                                    .aggregation_window_weights_[window_index];
+                            numerator[x] += contribution_weight * sample_row[x];
+                            weight[x] += contribution_weight;
+                        }
+                    }
                 }
             }
         }
@@ -1538,7 +1842,9 @@ process_anchor_impl(ConstVideoView noisy, ConstVideoView reference,
             }
 
             workspace.output_sample_major_ = false;
+            reset_aggregation_weights(workspace, similar);
             process_group(similar);
+            finalize_aggregation_weights(workspace, similar);
             if (workspace.output_sample_major_) {
                 write_sample_contributions_coupled(workspace, anchor_frame,
                                                    similar, contributions);
@@ -1559,11 +1865,11 @@ process_anchor_impl(ConstVideoView noisy, ConstVideoView reference,
 void validate_stage_parameters(StageParameters parameters, Stage stage) {
     require(parameters.sigma > 0.0F, "sigma must be positive");
     require(parameters.patch_size > 0, "block_size must be positive");
-    require(parameters.patch_time > 0, "patch time must be positive");
+    require(parameters.patch_time > 0, "patch_time must be positive");
     require(parameters.search_window > 0 && parameters.search_window % 2 == 1,
             "bm_range must describe a positive odd search window");
     require(parameters.search_bwd >= 0 && parameters.search_fwd >= 0,
-            "temporal search ranges must be non-negative");
+            "search_bwd and search_fwd must be non-negative");
     require(parameters.similar > 0, "group_size must be positive");
     require(parameters.rank >= 0, "rank must be non-negative");
     require(std::isfinite(parameters.similar_cap_factor) &&
@@ -1577,9 +1883,24 @@ void validate_stage_parameters(StageParameters parameters, Stage stage) {
     require(parameters.beta > 0.0F, "beta must be positive");
     require(parameters.tau >= 0.0F, "tau must be non-negative");
     require(std::isfinite(parameters.variance_threshold),
-            "variance threshold must be finite");
+            "variance_threshold must be finite");
     require(parameters.sigma_basic >= 0.0F, "sigma_basic must be non-negative");
     require(parameters.gamma > 0.0F, "gamma must be positive");
+    require(std::isfinite(parameters.weight_alpha) &&
+                parameters.weight_alpha >= 0.0F,
+            "weight_alpha must be finite and non-negative");
+    require(std::isfinite(parameters.weight_beta) &&
+                parameters.weight_beta >= 0.0F,
+            "weight_beta must be finite and non-negative");
+    require(std::isfinite(parameters.weight_gamma) &&
+                parameters.weight_gamma >= 0.0F,
+            "weight_gamma must be finite and non-negative");
+    require(std::isfinite(parameters.weight_epsilon) &&
+                parameters.weight_epsilon > 0.0F,
+            "weight_epsilon must be finite and positive");
+    require(std::isfinite(parameters.membership_noise_floor) &&
+                parameters.membership_noise_floor > 0.0F,
+            "membership_noise_floor must be finite and positive");
     require(normalized_proc_step(stage, parameters) > 0,
             "block_step must be positive");
     require(!parameters.order_invariance,
@@ -1595,20 +1916,19 @@ void validate_stage_configuration(VideoGeometry geometry,
             "local frame window must fit inside the source frame count");
     require(parameters.patch_size <= geometry.width &&
                 parameters.patch_size <= geometry.height,
-            "patch size must fit inside the frame");
+            "block_size must fit inside the frame");
     require(parameters.patch_time <= geometry.source_frames(),
-            "patch time must fit inside the clip");
+            "patch_time must fit inside the clip");
     const int patch_dim =
         parameters.patch_size * parameters.patch_size * parameters.patch_time;
     const int estimator_dim =
         patch_dim * (parameters.couple_channels ? geometry.channels : 1);
     require(parameters.rank <= estimator_dim,
-            "full-rank VNLB fallback is not implemented; rank must not exceed "
-            "the estimator dimension");
+            "rank must not exceed the effective patch dimension");
     require(
         parameters.similar >=
             std::min(estimator_dim, effective_rank(parameters, estimator_dim)),
-        "similar patch count must cover the effective VNLB rank");
+        "group_size must cover the effective VNLB rank");
 }
 
 FrameRange input_frame_range_for_anchor(VideoGeometry geometry,
@@ -1655,6 +1975,11 @@ void StageWorkspace::prepare(VideoGeometry geometry, StageParameters parameters,
     filter_coefficients_.resize(static_cast<std::size_t>(estimator_dim_));
     reference_patch_.resize(
         static_cast<std::size_t>(geometry.channels * patch_dim_));
+    aggregation_log_patch_weights_.resize(
+        static_cast<std::size_t>(max_similar_));
+    aggregation_patch_weights_.resize(static_cast<std::size_t>(max_similar_));
+    aggregation_scores_.resize(static_cast<std::size_t>(max_similar_));
+    prepare_aggregation_window(*this);
 }
 
 ProcessStats process_basic_anchor_no_flow(
