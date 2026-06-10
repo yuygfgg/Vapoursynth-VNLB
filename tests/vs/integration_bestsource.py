@@ -78,6 +78,21 @@ def run_chain(
     return clip_to_array(final, frames)
 
 
+def assert_basic_rejects_final_only_params(core: vs.Core) -> None:
+    clip = core.std.BlankClip(format=vs.GRAYS, width=16, height=16, length=1, color=0)
+    final_only_params = {
+        "sigma_basic": 0.0,
+        "gamma": 0.95,
+        "flat_areas": 0,
+    }
+    for name, value in final_only_params.items():
+        try:
+            core.vnlb.Basic(clip, sigma=5.1, **{name: value})
+        except vs.Error:
+            continue
+        raise AssertionError(f"Basic accepted final-only parameter {name!r}")
+
+
 def build_cases(
     core: vs.Core, source_root: Path, cache_dir: Path
 ) -> dict[str, np.ndarray]:
@@ -180,6 +195,7 @@ def main() -> int:
 
     core = vs.core
     core.std.LoadPlugin(path=str(plugin_path))
+    assert_basic_rejects_final_only_params(core)
     actual = build_cases(core, source_root, cache_dir)
 
     if update:

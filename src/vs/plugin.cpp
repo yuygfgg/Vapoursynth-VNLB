@@ -239,15 +239,17 @@ parse_stage_parameters(const VSMap* in, const VSAPI* vsapi, Stage stage) {
         map_get_optional_tau_8bit(in, vsapi, "tau", parameters.tau);
     parameters.variance_threshold = map_get_optional_float(
         in, vsapi, "variance_threshold", parameters.variance_threshold);
-    parameters.sigma_basic = map_get_optional_sigma_8bit(
-        in, vsapi, "sigma_basic", parameters.sigma_basic);
-    parameters.gamma =
-        map_get_optional_float(in, vsapi, "gamma", parameters.gamma);
     parameters.proc_step =
         map_get_optional_int(in, vsapi, "block_step", parameters.proc_step);
-    parameters.flat_areas =
-        map_get_optional_int(in, vsapi, "flat_areas",
-                             parameters.flat_areas ? 1 : 0) != 0;
+    if (stage == Stage::Final) {
+        parameters.sigma_basic = map_get_optional_sigma_8bit(
+            in, vsapi, "sigma_basic", parameters.sigma_basic);
+        parameters.gamma =
+            map_get_optional_float(in, vsapi, "gamma", parameters.gamma);
+        parameters.flat_areas =
+            map_get_optional_int(in, vsapi, "flat_areas",
+                                 parameters.flat_areas ? 1 : 0) != 0;
+    }
     parameters.couple_channels =
         map_get_optional_int(in, vsapi, "chroma",
                              parameters.couple_channels ? 1 : 0) != 0;
@@ -912,16 +914,14 @@ VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
         VS_MAKE_VERSION(VNLB_VERSION_MAJOR, VNLB_VERSION_MINOR),
         VAPOURSYNTH_API_VERSION, 0, plugin);
 
-    constexpr const char* stage_args =
+    constexpr const char* basic_args =
         "clip:vnode;sigma:float;block_size:int:opt;block_step:int:opt;"
         "group_size:int:opt;bm_range:int:opt;patch_time:int:opt;"
         "radius:int:opt;search_bwd:int:opt;search_fwd:int:opt;"
         "rank:int:opt;cap_factor:float:opt;model_cap_factor:float:opt;"
         "beta:float:opt;tau:float:opt;variance_threshold:float:opt;"
-        "sigma_basic:float:opt;"
-        "gamma:float:opt;flat_areas:int:opt;chroma:int:opt;"
-        "mvfw:vnode:opt;mvbw:vnode:opt;";
-    vspapi->registerFunction("Basic", stage_args, "clip:vnode;", BasicCreate,
+        "chroma:int:opt;mvfw:vnode:opt;mvbw:vnode:opt;";
+    vspapi->registerFunction("Basic", basic_args, "clip:vnode;", BasicCreate,
                              nullptr, plugin);
 
     constexpr const char* final_args =

@@ -61,7 +61,6 @@ def run_vnlb_chain(core: vs.Core, noisy: np.ndarray, meta: dict) -> tuple[np.nda
         **common,
         "tau": 0.0,
         "variance_threshold": float(params["basic_variance_threshold"]),
-        "flat_areas": 0,
     }
     basic_stack = core.vnlb.Basic(clip, **basic_params)
     basic = core.vnlb.Aggregate(

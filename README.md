@@ -30,7 +30,7 @@ pip install -U vapoursynth-vnlb
 This basic estimate produces a decent estimate of the noise-free image, as a reference for the final estimate.
 
 ```python
-vnlb.Basic(clip clip, float sigma[, int block_size=8, int block_step=8, int group_size=8, float cap_factor=4.0, float model_cap_factor=1.0, int bm_range=9, int patch_time=1, int radius=1, int search_bwd=1, int search_fwd=1, int rank=8, float beta=1.0, float tau=0.0, float variance_threshold=1.1, float sigma_basic=0.0, float gamma=0.95, int flat_areas=0, int chroma=1, clip mvfw=None, clip mvbw=None])
+vnlb.Basic(clip clip, float sigma[, int block_size=8, int block_step=8, int group_size=8, float cap_factor=4.0, float model_cap_factor=1.0, int bm_range=9, int patch_time=1, int radius=1, int search_bwd=1, int search_fwd=1, int rank=8, float beta=1.0, float tau=0.0, float variance_threshold=1.1, int chroma=1, clip mvfw=None, clip mvbw=None])
 ```
 
 - clip:
@@ -78,15 +78,6 @@ vnlb.Basic(clip clip, float sigma[, int block_size=8, int block_step=8, int grou
 - variance_threshold:
     Dimensionless cutoff applied to the internal normalized noise variance. Components below `variance_threshold * beta * sigma^2` are discarded. Higher values usually smooth more.
 
-- sigma_basic:
-    Final-stage reference noise level in 8-bit sample units. Models residual noise in `ref`. Use `0.0` when treating the Basic/reference clip as clean; increasing it makes Final discount noisy reference variance and can smooth more.
-
-- gamma:
-    Flat-area detector multiplier. It is used only when `flat_areas=1`; a group is treated as flat when its variance is below `gamma * sigma^2`.
-
-- flat_areas:
-    Enables the flat-area path. Can improve very flat regions, but may smooth low-contrast texture. Basic defaults to `0`; Final defaults to `1`.
-
 - chroma:
     Defaults to `1`. For `YUV444PS`, `chroma=1` estimates one coupled multi-channel model across Y, U, and V. Use `chroma=0` to process planes independently. `GrayS` clips ignore this setting.
 
@@ -107,8 +98,17 @@ vnlb.Final(clip clip, clip ref, float sigma[, ...])
 - ref:
     The reference clip, this clip is used in block-matching and as the reference in filtering. It must match `clip` format, dimensions, and frame count. In the usual two-stage chain this is the aggregated Basic estimate.
 
+- sigma_basic:
+    Final-stage reference noise level in 8-bit sample units. Models residual noise in `ref`. Use `0.0` when treating the Basic/reference clip as clean; increasing it makes Final discount noisy reference variance and can smooth more.
+
+- gamma:
+    Flat-area detector multiplier. It is used only when `flat_areas=1`; a group is treated as flat when its variance is below `gamma * sigma^2`.
+
+- flat_areas:
+    Enables the flat-area path. Can improve very flat regions, but may smooth low-contrast texture. Final defaults to `1`.
+
 - *Other parameters*:
-    Same as those in vnlb.Basic. Final uses different defaults for a few controls: `tau=400.0`, `variance_threshold=1.7`, `flat_areas=1`.
+    Same as those in vnlb.Basic. Final uses different defaults for `tau=400.0` and `variance_threshold=1.7`.
 
 #### aggregation of VNLB denoising filter
 
