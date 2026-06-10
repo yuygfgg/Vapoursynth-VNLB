@@ -2,8 +2,8 @@
 
 #include "common/compiler.hpp"
 #include "common/validation.hpp"
-#include "distance.hpp"
-#include "linalg/kernels.hpp"
+#include "distance_highway.hpp"
+#include "linalg/kernels_highway.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -56,8 +56,8 @@ void copy_float_row(const float* VNLB_RESTRICT source,
     if (count <= 0) {
         return;
     }
-    linalg::kernels::copy_contiguous(source, destination,
-                                     static_cast<std::size_t>(count));
+    linalg::kernels::copy_contiguous_highway(source, destination,
+                                             static_cast<std::size_t>(count));
 }
 
 [[nodiscard]] bool group_is_equal(const std::vector<float>& group, int channels,
@@ -316,17 +316,17 @@ void project_bayes_estimate(StageWorkspace& workspace, int rank,
 
             const float* basis = workspace.eigenvectors_.row_data(
                 static_cast<std::size_t>(component));
-            const float projection = linalg::kernels::dot_contiguous(
+            const float projection = linalg::kernels::dot_contiguous_highway(
                 input, basis, static_cast<std::size_t>(patch_dim));
 
             const float scaled_projection = coefficient * projection;
-            linalg::kernels::add_scaled_contiguous(
+            linalg::kernels::add_scaled_contiguous_highway(
                 output, basis, scaled_projection,
                 static_cast<std::size_t>(patch_dim));
         }
 
-        linalg::kernels::add_contiguous(output, center.data(),
-                                        static_cast<std::size_t>(patch_dim));
+        linalg::kernels::add_contiguous_highway(
+            output, center.data(), static_cast<std::size_t>(patch_dim));
     }
 }
 
@@ -713,7 +713,7 @@ void scan_basic_spatial_distances(ConstVideoView noisy, int x_low, int x_high,
                     candidate_x;
 
                 for (int y = 0; y < patch_size; ++y) {
-                    distance = distance::add_squared_row_distance(
+                    distance = distance::add_squared_row_distance_highway(
                         distance, reference_row, candidate_row, patch_size);
                     if (distance > distance_limit) {
                         break;
@@ -773,7 +773,7 @@ void scan_final_spatial_distances(
                         candidate_x;
 
                     for (int y = 0; y < patch_size; ++y) {
-                        distance = distance::add_squared_row_distance(
+                        distance = distance::add_squared_row_distance_highway(
                             distance, reference_row, candidate_row, patch_size);
                         if (distance > distance_limit) {
                             break;
@@ -1340,7 +1340,8 @@ void write_sample_contributions_coupled_contiguous(
                 const int row_offset = (output_y * layout.width) + match.x;
                 float* weight_row =
                     data + (slot * slot_stride) + weight_plane + row_offset;
-                linalg::kernels::add_scalar_contiguous(weight_row, 1.0F, count);
+                linalg::kernels::add_scalar_contiguous_highway(weight_row, 1.0F,
+                                                               count);
 
                 for (int channel = 0; channel < channels; ++channel) {
                     const float* sample_row =
@@ -1348,8 +1349,8 @@ void write_sample_contributions_coupled_contiguous(
                     float* numerator_row = data + (slot * slot_stride) +
                                            (channel * plane_pixels) +
                                            row_offset;
-                    linalg::kernels::add_contiguous(numerator_row, sample_row,
-                                                    count);
+                    linalg::kernels::add_contiguous_highway(numerator_row,
+                                                            sample_row, count);
                 }
             }
         }
@@ -1397,8 +1398,9 @@ void write_sample_contributions_coupled_planes(
                                     (static_cast<std::ptrdiff_t>(weight_row) *
                                      plane.stride) +
                                     match.x;
-                    linalg::kernels::add_contiguous_and_scalar_contiguous(
-                        numerator, weight, sample_row, 1.0F, count);
+                    linalg::kernels::
+                        add_contiguous_and_scalar_contiguous_highway(
+                            numerator, weight, sample_row, 1.0F, count);
                 }
             }
         }

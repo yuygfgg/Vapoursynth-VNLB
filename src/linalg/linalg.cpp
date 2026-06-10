@@ -2,7 +2,7 @@
 
 #include "backend.hpp"
 #include "common/validation.hpp"
-#include "kernels.hpp"
+#include "kernels_highway.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -49,13 +49,13 @@ template <Real T> T sqrt_value(T value) {
 
 template <Real T>
 T dot_contiguous(const T* left, const T* right, std::size_t count) noexcept {
-    return kernels::dot_contiguous(left, right, count);
+    return kernels::dot_contiguous_highway(left, right, count);
 }
 
 template <Real T>
 T dot_centered_rows(const T* left, const T* right, const T* mean,
                     std::size_t count) noexcept {
-    return kernels::dot_centered_rows(left, right, mean, count);
+    return kernels::dot_centered_rows_highway(left, right, mean, count);
 }
 
 template <Real T> void fill_matrix(MatrixView<T> matrix, T value) {
@@ -234,7 +234,7 @@ template <Real T> void normalize_or_zero(T* row, std::size_t count, T floor) {
     }
 
     const T scale = T{1} / sqrt_value(norm_squared);
-    kernels::scale_contiguous(row, scale, count);
+    kernels::scale_contiguous_highway(row, scale, count);
 }
 
 [[nodiscard]] bool worth_calling_syrk_backend(std::size_t dimension) noexcept {
@@ -311,7 +311,7 @@ void center_rows(ConstMatrixView<T> samples, std::span<const T> mean,
     for (std::size_t row = 0; row < samples.rows(); ++row) {
         const T* input = samples.row_data(row);
         T* output = centered.row_data(row);
-        kernels::center_row(input, mean.data(), output, samples.cols());
+        kernels::center_row_highway(input, mean.data(), output, samples.cols());
     }
 }
 
@@ -390,8 +390,9 @@ void compute_covariance_centered(ConstMatrixView<T> centered_samples,
         for (std::size_t col0 = 0; col0 < centered_samples.cols(); ++col0) {
             const T left = row[col0];
             T* cov_row = covariance.row_data(col0);
-            kernels::add_scaled_contiguous(cov_row + col0, row + col0, left,
-                                           centered_samples.cols() - col0);
+            kernels::add_scaled_contiguous_highway(
+                cov_row + col0, row + col0, left,
+                centered_samples.cols() - col0);
         }
     }
 
@@ -571,13 +572,13 @@ void map_dual_eigenvectors_to_basis(
              ++sample) {
             const T coefficient = sample_vector[sample];
             const T* sample_row = centered_samples.row_data(sample);
-            kernels::add_scaled_contiguous(basis_row, sample_row, coefficient,
-                                           centered_samples.cols());
+            kernels::add_scaled_contiguous_highway(
+                basis_row, sample_row, coefficient, centered_samples.cols());
         }
 
         const T inv_sqrt_eigenvalue = T{1} / sqrt_value(eigenvalue);
-        kernels::scale_contiguous(basis_row, inv_sqrt_eigenvalue,
-                                  basis_vectors.cols());
+        kernels::scale_contiguous_highway(basis_row, inv_sqrt_eigenvalue,
+                                          basis_vectors.cols());
 
         normalize_or_zero(basis_row, basis_vectors.cols(), eigenvalue_floor);
     }
@@ -603,8 +604,8 @@ void project_low_rank_centered(
             const T* basis_row = basis_vectors.row_data(basis);
             const T coefficient =
                 dot_contiguous(sample_row, basis_row, centered_samples.cols());
-            kernels::add_scaled_contiguous(output_row, basis_row, coefficient,
-                                           centered_samples.cols());
+            kernels::add_scaled_contiguous_highway(
+                output_row, basis_row, coefficient, centered_samples.cols());
         }
     }
 }
@@ -632,8 +633,8 @@ void project_low_rank(ConstMatrixView<T> samples, std::span<const T> mean,
             for (std::size_t col = 0; col < samples.cols(); ++col) {
                 coefficient += (sample_row[col] - mean[col]) * basis_row[col];
             }
-            kernels::add_scaled_contiguous(output_row, basis_row, coefficient,
-                                           samples.cols());
+            kernels::add_scaled_contiguous_highway(output_row, basis_row,
+                                                   coefficient, samples.cols());
         }
     }
 }
