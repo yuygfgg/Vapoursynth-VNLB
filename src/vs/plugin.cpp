@@ -1,4 +1,5 @@
 #include "aggregate/aggregate.hpp"
+#include "common/compiler.hpp"
 #include "core/core.hpp"
 #include "flow/flow.hpp"
 #include "vnlb_version.hpp"
@@ -426,8 +427,10 @@ void append_frame_planes(const VSFrame* frame, int channels,
                          std::vector<ConstPlaneView>& planes,
                          const VSAPI* vsapi) {
     for (int plane = 0; plane < channels; ++plane) {
+        const float* VNLB_RESTRICT plane_data =
+            reinterpret_cast<const float*>(vsapi->getReadPtr(frame, plane));
         planes.push_back(ConstPlaneView{
-            reinterpret_cast<const float*>(vsapi->getReadPtr(frame, plane)),
+            plane_data,
             stride_in_floats(frame, plane, vsapi),
         });
     }
@@ -449,8 +452,10 @@ void append_frame_planes(const VSFrame* frame, int channels,
     thread_data.contribution_planes.reserve(
         static_cast<std::size_t>(layout.channels));
     for (int channel = 0; channel < layout.channels; ++channel) {
+        float* VNLB_RESTRICT plane_data =
+            reinterpret_cast<float*>(vsapi->getWritePtr(out, channel));
         thread_data.contribution_planes.push_back(ContributionPlaneView{
-            reinterpret_cast<float*>(vsapi->getWritePtr(out, channel)),
+            plane_data,
             stride_in_floats(out, channel, vsapi),
         });
     }
@@ -744,10 +749,10 @@ void request_aggregate_frames(const VAggregateData* data, int frame,
     for (int plane = 0; plane < channels; ++plane) {
         const int width = vsapi->getFrameWidth(src_frame, plane);
         const int height = vsapi->getFrameHeight(src_frame, plane);
-        const auto* src =
+        const float* VNLB_RESTRICT src =
             reinterpret_cast<const float*>(vsapi->getReadPtr(src_frame, plane));
         const int src_stride = stride_in_floats(src_frame, plane, vsapi);
-        auto* dst =
+        float* VNLB_RESTRICT dst =
             reinterpret_cast<float*>(vsapi->getWritePtr(dst_frame, plane));
         const int dst_stride = stride_in_floats(dst_frame, plane, vsapi);
 
@@ -758,21 +763,24 @@ void request_aggregate_frames(const VAggregateData* data, int frame,
             const int anchor = first_anchor + static_cast<int>(index);
             const int slot = frame - anchor + data->search_bwd;
             numerator_base_rows[index] = slot * 2 * height;
-            contribution_ptrs[index] = reinterpret_cast<const float*>(
-                vsapi->getReadPtr(frames[index], plane));
+            const float* VNLB_RESTRICT contribution =
+                reinterpret_cast<const float*>(
+                    vsapi->getReadPtr(frames[index], plane));
+            contribution_ptrs[index] = contribution;
             contribution_strides[index] =
                 stride_in_floats(frames[index], plane, vsapi);
         }
 
         for (int y = 0; y < height; ++y) {
-            const float* src_row = src + (y * src_stride);
-            float* dst_row = dst + (y * dst_stride);
+            const float* VNLB_RESTRICT src_row = src + (y * src_stride);
+            float* VNLB_RESTRICT dst_row = dst + (y * dst_stride);
             for (int x = 0; x < width; ++x) {
                 float numerator = 0.0F;
                 float weight = 0.0F;
                 for (std::size_t index = 0; index < frames.size(); ++index) {
                     const int base_row = numerator_base_rows[index];
-                    const auto* contribution_ptr = contribution_ptrs[index];
+                    const float* VNLB_RESTRICT contribution_ptr =
+                        contribution_ptrs[index];
                     const int contribution_stride = contribution_strides[index];
                     numerator += contribution_ptr[((base_row + y) *
                                                    contribution_stride) +

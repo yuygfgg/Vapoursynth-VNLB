@@ -133,7 +133,8 @@ void copy_group_channel_to_samples(const std::vector<float>& group, int channel,
                    static_cast<std::size_t>(patch_dim));
     const int channel_base = channel * patch_dim * similar;
     for (int patch = 0; patch < similar; ++patch) {
-        float* row = samples.row_data(static_cast<std::size_t>(patch));
+        float* VNLB_RESTRICT row =
+            samples.row_data(static_cast<std::size_t>(patch));
         for (int position = 0; position < patch_dim; ++position) {
             row[position] = group[static_cast<std::size_t>(
                 channel_base + (position * similar) + patch)];
@@ -146,7 +147,8 @@ void copy_samples_to_group_channel(const linalg::Matrix<float>& samples,
                                    std::vector<float>& group) {
     const int channel_base = channel * patch_dim * similar;
     for (int patch = 0; patch < similar; ++patch) {
-        const float* row = samples.row_data(static_cast<std::size_t>(patch));
+        const float* VNLB_RESTRICT row =
+            samples.row_data(static_cast<std::size_t>(patch));
         for (int position = 0; position < patch_dim; ++position) {
             group[static_cast<std::size_t>(channel_base + (position * similar) +
                                            patch)] = row[position];
@@ -161,7 +163,8 @@ void copy_group_coupled_to_samples(const std::vector<float>& group,
     samples.resize(static_cast<std::size_t>(similar),
                    static_cast<std::size_t>(sample_dim));
     for (int patch = 0; patch < similar; ++patch) {
-        float* row = samples.row_data(static_cast<std::size_t>(patch));
+        float* VNLB_RESTRICT row =
+            samples.row_data(static_cast<std::size_t>(patch));
         for (int channel = 0; channel < channels; ++channel) {
             const int channel_base = channel * patch_dim * similar;
             const int output_base = channel * patch_dim;
@@ -177,7 +180,8 @@ void copy_samples_to_group_coupled(const linalg::Matrix<float>& samples,
                                    int channels, int patch_dim, int similar,
                                    std::vector<float>& group) {
     for (int patch = 0; patch < similar; ++patch) {
-        const float* row = samples.row_data(static_cast<std::size_t>(patch));
+        const float* VNLB_RESTRICT row =
+            samples.row_data(static_cast<std::size_t>(patch));
         for (int channel = 0; channel < channels; ++channel) {
             const int channel_base = channel * patch_dim * similar;
             const int input_base = channel * patch_dim;
@@ -194,7 +198,9 @@ void copy_samples(linalg::ConstMatrixView<float> input,
                   linalg::Matrix<float>& output) {
     output.resize(input.rows(), input.cols());
     for (std::size_t row = 0; row < input.rows(); ++row) {
-        std::copy_n(input.row_data(row), input.cols(), output.row_data(row));
+        const float* VNLB_RESTRICT input_row = input.row_data(row);
+        float* VNLB_RESTRICT output_row = output.row_data(row);
+        std::copy_n(input_row, input.cols(), output_row);
     }
 }
 
@@ -235,9 +241,9 @@ void center_samples_with_mean(const linalg::Matrix<float>& samples,
         return false;
     }
 
-    const float* first = samples.row_data(0);
+    const float* VNLB_RESTRICT first = samples.row_data(0);
     for (std::size_t row = 1; row < samples.rows(); ++row) {
-        const float* current = samples.row_data(row);
+        const float* VNLB_RESTRICT current = samples.row_data(row);
         for (std::size_t col = 0; col < samples.cols(); ++col) {
             if (current[col] != first[col]) {
                 return false;
@@ -261,7 +267,7 @@ samples_channel_variance(linalg::ConstMatrixView<float> samples, int channels,
         double sum = 0.0;
         double sum2 = 0.0;
         for (std::size_t row = 0; row < samples.rows(); ++row) {
-            const float* row_data = samples.row_data(row);
+            const float* VNLB_RESTRICT row_data = samples.row_data(row);
             for (int position = 0; position < patch_dim; ++position) {
                 const float value = row_data[channel_base + position];
                 sum += value;
@@ -300,9 +306,9 @@ void project_bayes_estimate(StageWorkspace& workspace, int rank,
                                static_cast<std::size_t>(patch_dim));
 
     for (int patch = 0; patch < similar; ++patch) {
-        const float* input =
+        const float* VNLB_RESTRICT input =
             workspace.centered_noisy_.row_data(static_cast<std::size_t>(patch));
-        float* output =
+        float* VNLB_RESTRICT output =
             workspace.filtered_.row_data(static_cast<std::size_t>(patch));
         std::fill_n(output, static_cast<std::size_t>(patch_dim), 0.0F);
 
@@ -314,7 +320,7 @@ void project_bayes_estimate(StageWorkspace& workspace, int rank,
                 continue;
             }
 
-            const float* basis = workspace.eigenvectors_.row_data(
+            const float* VNLB_RESTRICT basis = workspace.eigenvectors_.row_data(
                 static_cast<std::size_t>(component));
             const float projection = linalg::kernels::dot_contiguous_highway(
                 input, basis, static_cast<std::size_t>(patch_dim));
@@ -701,12 +707,13 @@ void scan_basic_spatial_distances(ConstVideoView noisy, int x_low, int x_high,
 
             for (int frame_delta = 0; frame_delta < parameters.patch_time;
                  ++frame_delta) {
-                const float* reference_row = workspace.reference_patch_.data() +
-                                             (frame_delta * patch_area);
+                const float* VNLB_RESTRICT reference_row =
+                    workspace.reference_patch_.data() +
+                    (frame_delta * patch_area);
                 const std::size_t plane_index =
                     static_cast<std::size_t>(frame_delta);
                 const int candidate_stride = plane_strides[plane_index];
-                const float* candidate_row =
+                const float* VNLB_RESTRICT candidate_row =
                     plane_bases[plane_index] +
                     (static_cast<std::ptrdiff_t>(candidate_y) *
                      candidate_stride) +
@@ -760,13 +767,13 @@ void scan_final_spatial_distances(
                 for (int frame_delta = 0; frame_delta < parameters.patch_time;
                      ++frame_delta) {
                     const int plane_index = channel_plane_base + frame_delta;
-                    const float* reference_row =
+                    const float* VNLB_RESTRICT reference_row =
                         workspace.reference_patch_.data() + channel_patch_base +
                         (frame_delta * patch_area);
                     const std::size_t plane_offset =
                         static_cast<std::size_t>(plane_index);
                     const int candidate_stride = plane_strides[plane_offset];
-                    const float* candidate_row =
+                    const float* VNLB_RESTRICT candidate_row =
                         plane_bases[plane_offset] +
                         (static_cast<std::ptrdiff_t>(candidate_y) *
                          candidate_stride) +
@@ -810,11 +817,11 @@ void load_reference_patch_basic(ConstVideoView noisy, int anchor_x,
         const int frame = anchor_frame + frame_delta;
         for (int y = 0; y < patch_size; ++y) {
             const int position = patch_position(patch_size, 0, y, frame_delta);
-            const float* input_row =
+            const float* VNLB_RESTRICT input_row =
                 noisy.row_data(frame, 0, anchor_y + y, anchor_x);
-            copy_float_row(input_row,
-                           workspace.reference_patch_.data() + position,
-                           patch_size);
+            float* VNLB_RESTRICT output_row =
+                workspace.reference_patch_.data() + position;
+            copy_float_row(input_row, output_row, patch_size);
         }
     }
 }
@@ -836,12 +843,11 @@ void load_reference_patch_final(ConstVideoView reference, int anchor_x,
             for (int y = 0; y < patch_size; ++y) {
                 const int position =
                     patch_position(patch_size, 0, y, frame_delta);
-                const float* input_row =
+                const float* VNLB_RESTRICT input_row =
                     reference.row_data(frame, channel, anchor_y + y, anchor_x);
-                copy_float_row(input_row,
-                               workspace.reference_patch_.data() +
-                                   channel_base + position,
-                               patch_size);
+                float* VNLB_RESTRICT output_row =
+                    workspace.reference_patch_.data() + channel_base + position;
+                copy_float_row(input_row, output_row, patch_size);
             }
         }
     }
@@ -1051,7 +1057,7 @@ void gather_basic_samples_coupled_planes(
     for (int patch = 0; patch < similar; ++patch) {
         const PatchMatch match =
             workspace.matches_[static_cast<std::size_t>(patch)];
-        float* row =
+        float* VNLB_RESTRICT row =
             workspace.samples_noisy_.row_data(static_cast<std::size_t>(patch));
         for (int channel = 0; channel < channels; ++channel) {
             const int channel_base = channel * patch_dim;
@@ -1065,7 +1071,7 @@ void gather_basic_samples_coupled_planes(
                 for (int y = 0; y < patch_size; ++y) {
                     const int position =
                         patch_position(patch_size, 0, y, frame_delta);
-                    const float* input_row =
+                    const float* VNLB_RESTRICT input_row =
                         plane.data +
                         (static_cast<std::ptrdiff_t>(match.y + y) *
                          plane.stride) +
@@ -1097,7 +1103,7 @@ void gather_basic_samples_coupled(ConstVideoView noisy,
     for (int patch = 0; patch < similar; ++patch) {
         const PatchMatch match =
             workspace.matches_[static_cast<std::size_t>(patch)];
-        float* row =
+        float* VNLB_RESTRICT row =
             workspace.samples_noisy_.row_data(static_cast<std::size_t>(patch));
         for (int channel = 0; channel < channels; ++channel) {
             const int channel_base = channel * patch_dim;
@@ -1105,12 +1111,13 @@ void gather_basic_samples_coupled(ConstVideoView noisy,
                  frame_delta < workspace.parameters_.patch_time;
                  ++frame_delta) {
                 const int frame = match.frame + frame_delta;
-                const float* plane = noisy.plane_data(frame, channel);
+                const float* VNLB_RESTRICT plane =
+                    noisy.plane_data(frame, channel);
                 const int stride = noisy.plane_stride(frame, channel);
                 for (int y = 0; y < patch_size; ++y) {
                     const int position =
                         patch_position(patch_size, 0, y, frame_delta);
-                    const float* input_row =
+                    const float* VNLB_RESTRICT input_row =
                         plane +
                         (static_cast<std::ptrdiff_t>(match.y + y) * stride) +
                         match.x;
@@ -1170,9 +1177,9 @@ void gather_final_samples_coupled_planes(
     for (int patch = 0; patch < similar; ++patch) {
         const PatchMatch match =
             workspace.matches_[static_cast<std::size_t>(patch)];
-        float* noisy_row =
+        float* VNLB_RESTRICT noisy_row =
             workspace.samples_noisy_.row_data(static_cast<std::size_t>(patch));
-        float* basic_row =
+        float* VNLB_RESTRICT basic_row =
             workspace.samples_basic_.row_data(static_cast<std::size_t>(patch));
         for (int channel = 0; channel < channels; ++channel) {
             const int channel_base = channel * patch_dim;
@@ -1188,12 +1195,12 @@ void gather_final_samples_coupled_planes(
                     const int position =
                         patch_position(patch_size, 0, y, frame_delta);
                     const int sample_position = channel_base + position;
-                    const float* noisy_input_row =
+                    const float* VNLB_RESTRICT noisy_input_row =
                         noisy_plane.data +
                         (static_cast<std::ptrdiff_t>(match.y + y) *
                          noisy_plane.stride) +
                         match.x;
-                    const float* basic_input_row =
+                    const float* VNLB_RESTRICT basic_input_row =
                         basic_plane.data +
                         (static_cast<std::ptrdiff_t>(match.y + y) *
                          basic_plane.stride) +
@@ -1234,9 +1241,9 @@ void gather_final_samples_coupled(ConstVideoView noisy, ConstVideoView basic,
     for (int patch = 0; patch < similar; ++patch) {
         const PatchMatch match =
             workspace.matches_[static_cast<std::size_t>(patch)];
-        float* noisy_row =
+        float* VNLB_RESTRICT noisy_row =
             workspace.samples_noisy_.row_data(static_cast<std::size_t>(patch));
-        float* basic_row =
+        float* VNLB_RESTRICT basic_row =
             workspace.samples_basic_.row_data(static_cast<std::size_t>(patch));
         for (int channel = 0; channel < channels; ++channel) {
             const int channel_base = channel * patch_dim;
@@ -1244,20 +1251,22 @@ void gather_final_samples_coupled(ConstVideoView noisy, ConstVideoView basic,
                  frame_delta < workspace.parameters_.patch_time;
                  ++frame_delta) {
                 const int frame = match.frame + frame_delta;
-                const float* noisy_plane = noisy.plane_data(frame, channel);
+                const float* VNLB_RESTRICT noisy_plane =
+                    noisy.plane_data(frame, channel);
                 const int noisy_stride = noisy.plane_stride(frame, channel);
-                const float* basic_plane = basic.plane_data(frame, channel);
+                const float* VNLB_RESTRICT basic_plane =
+                    basic.plane_data(frame, channel);
                 const int basic_stride = basic.plane_stride(frame, channel);
                 for (int y = 0; y < patch_size; ++y) {
                     const int position =
                         patch_position(patch_size, 0, y, frame_delta);
                     const int sample_position = channel_base + position;
-                    const float* noisy_input_row =
+                    const float* VNLB_RESTRICT noisy_input_row =
                         noisy_plane +
                         (static_cast<std::ptrdiff_t>(match.y + y) *
                          noisy_stride) +
                         match.x;
-                    const float* basic_input_row =
+                    const float* VNLB_RESTRICT basic_input_row =
                         basic_plane +
                         (static_cast<std::ptrdiff_t>(match.y + y) *
                          basic_stride) +
@@ -1325,7 +1334,8 @@ void write_sample_contributions_coupled_contiguous(
     for (int patch = 0; patch < similar; ++patch) {
         const PatchMatch match =
             workspace.matches_[static_cast<std::size_t>(patch)];
-        const float* row = samples.row_data(static_cast<std::size_t>(patch));
+        const float* VNLB_RESTRICT row =
+            samples.row_data(static_cast<std::size_t>(patch));
         for (int frame_delta = 0;
              frame_delta < workspace.parameters_.patch_time; ++frame_delta) {
             const int output_offset = match.frame + frame_delta - anchor_frame;
@@ -1338,17 +1348,17 @@ void write_sample_contributions_coupled_contiguous(
                 const int position =
                     patch_position(patch_size, 0, y, frame_delta);
                 const int row_offset = (output_y * layout.width) + match.x;
-                float* weight_row =
+                float* VNLB_RESTRICT weight_row =
                     data + (slot * slot_stride) + weight_plane + row_offset;
                 linalg::kernels::add_scalar_contiguous_highway(weight_row, 1.0F,
                                                                count);
 
                 for (int channel = 0; channel < channels; ++channel) {
-                    const float* sample_row =
+                    const float* VNLB_RESTRICT sample_row =
                         row + (channel * patch_dim) + position;
-                    float* numerator_row = data + (slot * slot_stride) +
-                                           (channel * plane_pixels) +
-                                           row_offset;
+                    float* VNLB_RESTRICT numerator_row =
+                        data + (slot * slot_stride) + (channel * plane_pixels) +
+                        row_offset;
                     linalg::kernels::add_contiguous_highway(numerator_row,
                                                             sample_row, count);
                 }
@@ -1370,7 +1380,8 @@ void write_sample_contributions_coupled_planes(
     for (int patch = 0; patch < similar; ++patch) {
         const PatchMatch match =
             workspace.matches_[static_cast<std::size_t>(patch)];
-        const float* row = samples.row_data(static_cast<std::size_t>(patch));
+        const float* VNLB_RESTRICT row =
+            samples.row_data(static_cast<std::size_t>(patch));
         for (int frame_delta = 0;
              frame_delta < workspace.parameters_.patch_time; ++frame_delta) {
             const int output_offset = match.frame + frame_delta - anchor_frame;
@@ -1387,17 +1398,18 @@ void write_sample_contributions_coupled_planes(
 
                 for (int channel = 0; channel < channels; ++channel) {
                     const auto plane = planes[channel];
-                    const float* sample_row =
+                    const float* VNLB_RESTRICT sample_row =
                         row + (channel * patch_dim) + position;
-                    float* numerator =
+                    float* VNLB_RESTRICT numerator =
                         plane.data +
                         (static_cast<std::ptrdiff_t>(numerator_row) *
                          plane.stride) +
                         match.x;
-                    float* weight = plane.data +
-                                    (static_cast<std::ptrdiff_t>(weight_row) *
-                                     plane.stride) +
-                                    match.x;
+                    float* VNLB_RESTRICT weight =
+                        plane.data +
+                        (static_cast<std::ptrdiff_t>(weight_row) *
+                         plane.stride) +
+                        match.x;
                     linalg::kernels::
                         add_contiguous_and_scalar_contiguous_highway(
                             numerator, weight, sample_row, 1.0F, count);

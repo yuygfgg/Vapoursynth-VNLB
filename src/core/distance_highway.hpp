@@ -1,5 +1,7 @@
 #pragma once
 
+#include "common/compiler.hpp"
+
 #include <hwy/highway.h>
 
 #include <cstddef>
@@ -7,7 +9,8 @@
 namespace vnlb::core::distance {
 
 [[nodiscard]] inline float add_squared_row_distance_highway(
-    float distance, const float* left, const float* right, int count) noexcept {
+    float distance, const float* VNLB_RESTRICT left,
+    const float* VNLB_RESTRICT right, int count) noexcept {
     if (count <= 0) {
         return distance;
     }

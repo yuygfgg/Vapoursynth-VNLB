@@ -1,6 +1,7 @@
 #include "linalg.hpp"
 
 #include "backend.hpp"
+#include "common/compiler.hpp"
 #include "common/validation.hpp"
 #include "kernels_highway.hpp"
 
@@ -48,13 +49,14 @@ template <Real T> T sqrt_value(T value) {
 }
 
 template <Real T>
-T dot_contiguous(const T* left, const T* right, std::size_t count) noexcept {
+T dot_contiguous(const T* VNLB_RESTRICT left, const T* VNLB_RESTRICT right,
+                 std::size_t count) noexcept {
     return kernels::dot_contiguous_highway(left, right, count);
 }
 
 template <Real T>
-T dot_centered_rows(const T* left, const T* right, const T* mean,
-                    std::size_t count) noexcept {
+T dot_centered_rows(const T* VNLB_RESTRICT left, const T* VNLB_RESTRICT right,
+                    const T* VNLB_RESTRICT mean, std::size_t count) noexcept {
     return kernels::dot_centered_rows_highway(left, right, mean, count);
 }
 
@@ -107,7 +109,7 @@ void require_square([[maybe_unused]] MatrixView<T> matrix,
 template <Real T> T max_abs_matrix(ConstMatrixView<T> matrix) {
     T max_value{};
     for (std::size_t row = 0; row < matrix.rows(); ++row) {
-        const T* row_data = matrix.row_data(row);
+        const T* VNLB_RESTRICT row_data = matrix.row_data(row);
         for (std::size_t col = 0; col < matrix.cols(); ++col) {
             max_value = std::max(max_value, abs_value(row_data[col]));
         }
@@ -118,7 +120,7 @@ template <Real T> T max_abs_matrix(ConstMatrixView<T> matrix) {
 template <Real T> T max_abs_offdiag(ConstMatrixView<T> matrix) {
     T max_value{};
     for (std::size_t row = 0; row < matrix.rows(); ++row) {
-        const T* row_data = matrix.row_data(row);
+        const T* VNLB_RESTRICT row_data = matrix.row_data(row);
         for (std::size_t col = row + 1; col < matrix.cols(); ++col) {
             max_value = std::max(max_value, abs_value(row_data[col]));
         }
@@ -138,8 +140,9 @@ void copy_matrix(ConstMatrixView<T> source, MatrixView<T> destination) {
     require_same_shape(source, destination,
                        "destination matrix shape must match source");
     for (std::size_t row = 0; row < source.rows(); ++row) {
-        std::copy_n(source.row_data(row), source.cols(),
-                    destination.row_data(row));
+        const T* VNLB_RESTRICT source_row = source.row_data(row);
+        T* VNLB_RESTRICT destination_row = destination.row_data(row);
+        std::copy_n(source_row, source.cols(), destination_row);
     }
 }
 
@@ -199,7 +202,7 @@ void canonicalize_vector_row(MatrixView<T> vectors, std::size_t row) {
     T norm_squared{};
     T max_abs{};
     std::size_t sign_pivot = 0;
-    T* row_data = vectors.row_data(row);
+    T* VNLB_RESTRICT row_data = vectors.row_data(row);
 
     for (std::size_t col = 0; col < vectors.cols(); ++col) {
         const T value = row_data[col];
@@ -225,7 +228,8 @@ void canonicalize_vector_row(MatrixView<T> vectors, std::size_t row) {
     }
 }
 
-template <Real T> void normalize_or_zero(T* row, std::size_t count, T floor) {
+template <Real T>
+void normalize_or_zero(T* VNLB_RESTRICT row, std::size_t count, T floor) {
     const T norm_squared = dot_contiguous(row, row, count);
 
     if (norm_squared <= floor) {
@@ -289,7 +293,7 @@ void compute_mean(ConstMatrixView<T> samples,
 
     std::fill(mean.begin(), mean.end(), T{});
     for (std::size_t row = 0; row < samples.rows(); ++row) {
-        const T* row_data = samples.row_data(row);
+        const T* VNLB_RESTRICT row_data = samples.row_data(row);
         for (std::size_t col = 0; col < samples.cols(); ++col) {
             mean[col] += row_data[col];
         }
@@ -309,8 +313,8 @@ void center_rows(ConstMatrixView<T> samples, std::span<const T> mean,
                        "centered matrix shape must match samples");
 
     for (std::size_t row = 0; row < samples.rows(); ++row) {
-        const T* input = samples.row_data(row);
-        T* output = centered.row_data(row);
+        const T* VNLB_RESTRICT input = samples.row_data(row);
+        T* VNLB_RESTRICT output = centered.row_data(row);
         kernels::center_row_highway(input, mean.data(), output, samples.cols());
     }
 }
@@ -334,7 +338,7 @@ void compute_gram_centered(ConstMatrixView<T> centered_samples,
     }
 
     for (std::size_t row = 0; row < centered_samples.rows(); ++row) {
-        const T* left = centered_samples.row_data(row);
+        const T* VNLB_RESTRICT left = centered_samples.row_data(row);
         for (std::size_t col = 0; col <= row; ++col) {
             const T value =
                 scale * dot_contiguous(left, centered_samples.row_data(col),
@@ -355,7 +359,7 @@ void compute_gram(ConstMatrixView<T> samples, std::span<const T> mean,
         "gram matrix must be samples.rows x samples.rows");
 
     for (std::size_t row = 0; row < samples.rows(); ++row) {
-        const T* left = samples.row_data(row);
+        const T* VNLB_RESTRICT left = samples.row_data(row);
         for (std::size_t col = 0; col <= row; ++col) {
             const T value =
                 scale * dot_centered_rows(left, samples.row_data(col),
@@ -386,10 +390,10 @@ void compute_covariance_centered(ConstMatrixView<T> centered_samples,
 
     fill_matrix(covariance, T{});
     for (std::size_t sample = 0; sample < centered_samples.rows(); ++sample) {
-        const T* row = centered_samples.row_data(sample);
+        const T* VNLB_RESTRICT row = centered_samples.row_data(sample);
         for (std::size_t col0 = 0; col0 < centered_samples.cols(); ++col0) {
             const T left = row[col0];
-            T* cov_row = covariance.row_data(col0);
+            T* VNLB_RESTRICT cov_row = covariance.row_data(col0);
             kernels::add_scaled_contiguous_highway(
                 cov_row + col0, row + col0, left,
                 centered_samples.cols() - col0);
@@ -417,10 +421,10 @@ void compute_covariance(ConstMatrixView<T> samples, std::span<const T> mean,
 
     fill_matrix(covariance, T{});
     for (std::size_t sample = 0; sample < samples.rows(); ++sample) {
-        const T* row = samples.row_data(sample);
+        const T* VNLB_RESTRICT row = samples.row_data(sample);
         for (std::size_t col0 = 0; col0 < samples.cols(); ++col0) {
             const T left = row[col0] - mean[col0];
-            T* cov_row = covariance.row_data(col0);
+            T* VNLB_RESTRICT cov_row = covariance.row_data(col0);
             for (std::size_t col1 = col0; col1 < samples.cols(); ++col1) {
                 cov_row[col1] += left * (row[col1] - mean[col1]);
             }
@@ -559,7 +563,7 @@ void map_dual_eigenvectors_to_basis(
                               "basis vector width must match sample dimension");
 
     for (std::size_t basis = 0; basis < basis_vectors.rows(); ++basis) {
-        T* basis_row = basis_vectors.row_data(basis);
+        T* VNLB_RESTRICT basis_row = basis_vectors.row_data(basis);
         std::fill_n(basis_row, basis_vectors.cols(), T{});
 
         const T eigenvalue = gram_eigenvalues[basis];
@@ -567,11 +571,13 @@ void map_dual_eigenvectors_to_basis(
             continue;
         }
 
-        const T* sample_vector = gram_eigenvectors.row_data(basis);
+        const T* VNLB_RESTRICT sample_vector =
+            gram_eigenvectors.row_data(basis);
         for (std::size_t sample = 0; sample < centered_samples.rows();
              ++sample) {
             const T coefficient = sample_vector[sample];
-            const T* sample_row = centered_samples.row_data(sample);
+            const T* VNLB_RESTRICT sample_row =
+                centered_samples.row_data(sample);
             kernels::add_scaled_contiguous_highway(
                 basis_row, sample_row, coefficient, centered_samples.cols());
         }
@@ -596,12 +602,12 @@ void project_low_rank_centered(
                               "basis vector width must match sample dimension");
 
     for (std::size_t sample = 0; sample < centered_samples.rows(); ++sample) {
-        const T* sample_row = centered_samples.row_data(sample);
-        T* output_row = output.row_data(sample);
+        const T* VNLB_RESTRICT sample_row = centered_samples.row_data(sample);
+        T* VNLB_RESTRICT output_row = output.row_data(sample);
         std::fill_n(output_row, output.cols(), T{});
 
         for (std::size_t basis = 0; basis < rank; ++basis) {
-            const T* basis_row = basis_vectors.row_data(basis);
+            const T* VNLB_RESTRICT basis_row = basis_vectors.row_data(basis);
             const T coefficient =
                 dot_contiguous(sample_row, basis_row, centered_samples.cols());
             kernels::add_scaled_contiguous_highway(
@@ -623,12 +629,12 @@ void project_low_rank(ConstMatrixView<T> samples, std::span<const T> mean,
                               "basis vector width must match sample dimension");
 
     for (std::size_t sample = 0; sample < samples.rows(); ++sample) {
-        const T* sample_row = samples.row_data(sample);
-        T* output_row = output.row_data(sample);
+        const T* VNLB_RESTRICT sample_row = samples.row_data(sample);
+        T* VNLB_RESTRICT output_row = output.row_data(sample);
         std::copy(mean.begin(), mean.end(), output_row);
 
         for (std::size_t basis = 0; basis < rank; ++basis) {
-            const T* basis_row = basis_vectors.row_data(basis);
+            const T* VNLB_RESTRICT basis_row = basis_vectors.row_data(basis);
             T coefficient{};
             for (std::size_t col = 0; col < samples.cols(); ++col) {
                 coefficient += (sample_row[col] - mean[col]) * basis_row[col];
