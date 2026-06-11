@@ -94,20 +94,20 @@ vnlb.Basic(clip clip, float sigma[, int block_size=8, int block_step=8, int grou
     Noise tolerance floor for patch membership weighting. Higher values make membership weighting less strict, allowing more averaging and smoother output. Lower values make it stricter, which can reject bad matches more aggressively but may leave more noise or uneven aggregation. Most users should leave it as default.
 
 > [!NOTE]
->   Formula reference:
+> Formula reference:
 >
->   $$
-    w_{k,i,u}
-    =
-    \tau_k^{-\alpha}
-    \cdot
-    \exp(-\beta M_{k,i})
-    \cdot
-    a(u)^\gamma
-    $$
+> $$
+w_{k,i,u}
+=
+\tau_k^{-\alpha}
+\cdot
+\exp(-\beta M_{k,i})
+\cdot
+a(u)^\gamma
+$$
 >
->   where `weight_alpha`, `weight_beta`, and `weight_gamma` are $\alpha$, $\beta$, and $\gamma$. 
-> 
+> where `weight_alpha`, `weight_beta`, and `weight_gamma` are $\alpha$, $\beta$, and $\gamma$.
+>
 > The group precision term is:
 >
 >   $$
@@ -140,6 +140,22 @@ vnlb.Basic(clip clip, float sigma[, int block_size=8, int block_step=8, int grou
     =
     \min_i Z_{k,i}
     $$
+>
+> Symbol notes:
+>
+> - $k$ is the group index, $i$ is the patch index inside that group, and $u$ is the pixel position inside the patch.
+> - $w_{k,i,u}$ is the aggregation weight applied to that patch contribution.
+> - $\tau_k$ is the group-confidence denominator; smaller values give group $k$ more weight.
+> - $M_{k,i}$ is the membership penalty for patch $i$ under group $k$; larger values reduce that patch's weight.
+> - $a(u)$ is the normalized patch window value at position $u$.
+> - $d$ is the estimator patch dimension, and $d_m$ is the dimension used for membership scoring.
+> - $n_{\mathrm{eff},k}$ is the number of patches used to estimate group $k$'s model.
+> - $\lambda_{k,j}$ is the signal covariance eigenvalue of component $j$ in group $k$.
+> - $\sigma_{\mathrm{est}}^2$ is the noise variance used by the Wiener shrinkage term.
+> - $\sigma_{\mathrm{eff}}^2$ is the membership noise variance after applying `membership_noise_floor`.
+> - $\varepsilon$ is `weight_epsilon`.
+> - $D_{k,i}$ is the Mahalanobis distance of patch $i$ to group $k$'s model.
+> - $Z_{k,i}$ is the chi-square normalized form of $D_{k,i}$, and $Z_{k,\mathrm{ref}}$ is the best score inside the group.
 
 - chroma:
     Defaults to `1`. For `YUV444PS`, `chroma=1` estimates one coupled multi-channel model across Y, U, and V. Use `chroma=0` to process planes independently. `GrayS` clips ignore this setting.
