@@ -39,6 +39,7 @@ include = [
   "/packaging",
   "/pyproject.toml",
   "/src",
+  "/tools/repair_windows_wheel.py",
   "/tools/version.py",
 ]
 

@@ -253,9 +253,9 @@ jobs:
           BUILD_ENVIRONMENT: ${{ matrix.build_environment }}
         shell: bash
         run: |
-          python -m pip install -U build
+          python -m pip install -U --index-url https://pypi.org/simple build
           if [[ "${RUNNER_OS}" == "Windows" ]]; then
-            python -m pip install -U delvewheel
+            python -m pip install -U --index-url https://pypi.org/simple delvewheel==1.13.0
           fi
           while IFS= read -r assignment; do
             [[ -z "${assignment}" ]] && continue
@@ -264,11 +264,20 @@ jobs:
           python -m build --wheel
           if [[ "${RUNNER_OS}" == "Windows" ]]; then
             mkdir -p wheelhouse
-            python -m delvewheel repair \
+            python tools/repair_windows_wheel.py \
               --add-path C:/openblas/bin \
               --add-path C:/msys64/mingw64/bin \
               -w wheelhouse dist/*.whl
           fi
+
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            python -m zipfile -l wheelhouse/*.whl
+            python -m pip install --force-reinstall wheelhouse/*.whl
+          else
+            python -m pip install --force-reinstall dist/*.whl
+          fi
+          python -m vapoursynth config
+          python -c "import vapoursynth as vs; assert hasattr(vs.core, 'vnlb')"
 
       - name: Build wheel with cibuildwheel
         if: matrix.builder == 'cibuildwheel'
