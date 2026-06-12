@@ -36,9 +36,7 @@ void require(bool condition, const char* message) {
            lhs.weight_gamma == rhs.weight_gamma;
 }
 
-[[nodiscard]] int normalized_proc_step(Stage stage,
-                                       StageParameters parameters) noexcept {
-    (void)stage;
+[[nodiscard]] int normalized_proc_step(StageParameters parameters) noexcept {
     if (parameters.proc_step > 0) {
         return parameters.proc_step;
     }
@@ -141,9 +139,9 @@ aggregation_weights_enabled(StageParameters parameters) noexcept {
     return positive_or_zero(observed_eigenvalue - model_noise2);
 }
 
-[[nodiscard]] float model_noise_variance(StageParameters parameters,
-                                         Stage stage) noexcept {
-    if (stage == Stage::Final) {
+template <Stage stage>
+[[nodiscard]] float model_noise_variance(StageParameters parameters) noexcept {
+    if constexpr (stage == Stage::Final) {
         return parameters.beta * parameters.sigma_basic *
                parameters.sigma_basic;
     }
@@ -155,21 +153,25 @@ estimate_noise_variance(StageParameters parameters) noexcept {
     return parameters.beta * parameters.sigma * parameters.sigma;
 }
 
-[[nodiscard]] float membership_noise_variance(StageParameters parameters,
-                                              Stage stage) noexcept {
-    const float match_sigma =
-        stage == Stage::Final ? parameters.sigma_basic : parameters.sigma;
+template <Stage stage>
+[[nodiscard]] float
+membership_noise_variance(StageParameters parameters) noexcept {
+    float match_sigma = parameters.sigma;
+    if constexpr (stage == Stage::Final) {
+        match_sigma = parameters.sigma_basic;
+    }
     const float match_noise2 = match_sigma * match_sigma;
     const float floor_noise2 =
         parameters.membership_noise_floor * parameters.sigma * parameters.sigma;
     return std::max(match_noise2, floor_noise2);
 }
 
-[[nodiscard]] float group_precision_tau(StageParameters parameters, Stage stage,
+template <Stage stage>
+[[nodiscard]] float group_precision_tau(StageParameters parameters,
                                         std::span<const float> eigenvalues,
                                         int rank, int sample_dim,
                                         int basis_similar) noexcept {
-    const float model_noise2 = model_noise_variance(parameters, stage);
+    const float model_noise2 = model_noise_variance<stage>(parameters);
     const float estimate_noise2 = estimate_noise_variance(parameters);
     float trace = 0.0F;
     for (int component = 0; component < rank; ++component) {
@@ -268,7 +270,8 @@ void prepare_aggregation_window(StageWorkspace& workspace) {
     }
 }
 
-void accumulate_aggregation_model(StageWorkspace& workspace, Stage stage,
+template <Stage stage>
+void accumulate_aggregation_model(StageWorkspace& workspace,
                                   linalg::ConstMatrixView<float> centered,
                                   std::span<const float> eigenvalues, int rank,
                                   int basis_similar) {
@@ -280,8 +283,8 @@ void accumulate_aggregation_model(StageWorkspace& workspace, Stage stage,
 
     const int similar = static_cast<int>(centered.rows());
     const int sample_dim = static_cast<int>(centered.cols());
-    const float tau = group_precision_tau(parameters, stage, eigenvalues, rank,
-                                          sample_dim, basis_similar);
+    const float tau = group_precision_tau<stage>(parameters, eigenvalues, rank,
+                                                 sample_dim, basis_similar);
     const float log_group_weight =
         parameters.weight_alpha == 0.0F
             ? 0.0F
@@ -289,9 +292,9 @@ void accumulate_aggregation_model(StageWorkspace& workspace, Stage stage,
 
     float volume = 0.0F;
     if (parameters.weight_beta != 0.0F) {
-        const float model_noise2 = model_noise_variance(parameters, stage);
+        const float model_noise2 = model_noise_variance<stage>(parameters);
         const float membership_noise2 =
-            membership_noise_variance(parameters, stage);
+            membership_noise_variance<stage>(parameters);
         for (int component = 0; component < rank; ++component) {
             const float lambda = signal_eigenvalue(
                 eigenvalues[static_cast<std::size_t>(component)], model_noise2);
@@ -572,14 +575,16 @@ void project_bayes_estimate(StageWorkspace& workspace, int rank,
     }
 }
 
-void compute_filter_coefficients(StageWorkspace& workspace, Stage stage,
+template <Stage stage>
+void compute_filter_coefficients(StageWorkspace& workspace,
                                  std::span<const float> eigenvalues, int rank) {
     const StageParameters parameters = workspace.parameters_;
     const float sigma2 = parameters.beta * parameters.sigma * parameters.sigma;
-    const float sigma_basic2 =
-        stage == Stage::Final
-            ? parameters.beta * parameters.sigma_basic * parameters.sigma_basic
-            : sigma2;
+    float sigma_basic2 = sigma2;
+    if constexpr (stage == Stage::Final) {
+        sigma_basic2 =
+            parameters.beta * parameters.sigma_basic * parameters.sigma_basic;
+    }
     const float threshold = parameters.variance_threshold * sigma2;
 
     for (int component = 0; component < rank; ++component) {
@@ -592,8 +597,9 @@ void compute_filter_coefficients(StageWorkspace& workspace, Stage stage,
     }
 }
 
-void filter_vnlb_samples(StageWorkspace& workspace, Stage stage, int similar,
-                         int sample_dim, bool flat_patch) {
+template <Stage stage>
+void filter_vnlb_samples(StageWorkspace& workspace, int similar, int sample_dim,
+                         bool flat_patch) {
     const int rank = effective_rank(workspace.parameters_, sample_dim);
     const int basis_similar =
         std::min(similar, model_similar_cap(workspace.parameters_));
@@ -604,8 +610,11 @@ void filter_vnlb_samples(StageWorkspace& workspace, Stage stage, int similar,
 
     auto mean_noisy = std::span<float>(workspace.mean_noisy_.data(),
                                        static_cast<std::size_t>(sample_dim));
-    auto mean_basic = std::span<float>(workspace.mean_basic_.data(),
-                                       static_cast<std::size_t>(sample_dim));
+    [[maybe_unused]] auto mean_basic = std::span<float>(
+        workspace.mean_basic_.data(), static_cast<std::size_t>(sample_dim));
+    if constexpr (stage == Stage::Basic) {
+        (void)flat_patch;
+    }
     constexpr int dual_pca_min_dimension = 64;
     const bool use_dual_pca =
         sample_dim >= dual_pca_min_dimension && basis_similar < sample_dim;
@@ -613,7 +622,7 @@ void filter_vnlb_samples(StageWorkspace& workspace, Stage stage, int similar,
     const linalg::ConstMatrixView<float> noisy_basis =
         first_matrix_rows(workspace.samples_noisy_, basis_similar);
 
-    if (stage == Stage::Final) {
+    if constexpr (stage == Stage::Final) {
         const linalg::ConstMatrixView<float> basic_basis =
             first_matrix_rows(workspace.samples_basic_, basis_similar);
         linalg::compute_mean(basic_basis, mean_basic);
@@ -651,19 +660,26 @@ void filter_vnlb_samples(StageWorkspace& workspace, Stage stage, int similar,
     if (rank == 0) {
         workspace.filtered_.resize(workspace.samples_noisy_.rows(),
                                    workspace.samples_noisy_.cols());
-        const auto center = (stage == Stage::Final && flat_patch)
-                                ? std::span<const float>(mean_basic)
-                                : std::span<const float>(mean_noisy);
+        std::span<const float> center = mean_noisy;
+        if constexpr (stage == Stage::Final) {
+            if (flat_patch) {
+                center = mean_basic;
+            }
+        }
         for (std::size_t row = 0; row < workspace.filtered_.rows(); ++row) {
             std::copy(center.begin(), center.end(),
                       workspace.filtered_.row_data(row));
         }
-        const linalg::ConstMatrixView<float> membership_centered =
-            stage == Stage::Final ? workspace.centered_basic_.cview()
-                                  : workspace.centered_noisy_.cview();
-        accumulate_aggregation_model(workspace, stage, membership_centered,
-                                     std::span<const float>{}, rank,
-                                     basis_similar);
+        const linalg::ConstMatrixView<float> membership_centered = [&]() {
+            if constexpr (stage == Stage::Final) {
+                return workspace.centered_basic_.cview();
+            } else {
+                return workspace.centered_noisy_.cview();
+            }
+        }();
+        accumulate_aggregation_model<stage>(workspace, membership_centered,
+                                            std::span<const float>{}, rank,
+                                            basis_similar);
         return;
     }
 
@@ -672,10 +688,13 @@ void filter_vnlb_samples(StageWorkspace& workspace, Stage stage, int similar,
     auto eigenvalues = std::span<float>(workspace.eigenvalues_.data(),
                                         static_cast<std::size_t>(rank));
     const float covariance_scale = 1.0F / static_cast<float>(basis_similar);
-    const linalg::ConstMatrixView<float> basis_samples =
-        stage == Stage::Basic
-            ? first_matrix_rows(workspace.centered_noisy_, basis_similar)
-            : first_matrix_rows(workspace.centered_basic_, basis_similar);
+    const linalg::ConstMatrixView<float> basis_samples = [&]() {
+        if constexpr (stage == Stage::Basic) {
+            return first_matrix_rows(workspace.centered_noisy_, basis_similar);
+        } else {
+            return first_matrix_rows(workspace.centered_basic_, basis_similar);
+        }
+    }();
     if (use_dual_pca) {
         workspace.gram_.resize(static_cast<std::size_t>(basis_similar),
                                static_cast<std::size_t>(basis_similar));
@@ -711,56 +730,65 @@ void filter_vnlb_samples(StageWorkspace& workspace, Stage stage, int similar,
 
     const auto eigenvalue_span =
         std::span<const float>(eigenvalues.data(), eigenvalues.size());
-    compute_filter_coefficients(workspace, stage, eigenvalue_span, rank);
+    compute_filter_coefficients<stage>(workspace, eigenvalue_span, rank);
 
-    const linalg::ConstMatrixView<float> membership_centered =
-        stage == Stage::Final ? workspace.centered_basic_.cview()
-                              : workspace.centered_noisy_.cview();
-    accumulate_aggregation_model(workspace, stage, membership_centered,
-                                 eigenvalue_span, rank, basis_similar);
+    const linalg::ConstMatrixView<float> membership_centered = [&]() {
+        if constexpr (stage == Stage::Final) {
+            return workspace.centered_basic_.cview();
+        } else {
+            return workspace.centered_noisy_.cview();
+        }
+    }();
+    accumulate_aggregation_model<stage>(workspace, membership_centered,
+                                        eigenvalue_span, rank, basis_similar);
 
-    const auto center = (stage == Stage::Final && flat_patch)
-                            ? std::span<const float>(mean_basic)
-                            : std::span<const float>(mean_noisy);
+    std::span<const float> center = mean_noisy;
+    if constexpr (stage == Stage::Final) {
+        if (flat_patch) {
+            center = mean_basic;
+        }
+    }
     project_bayes_estimate(workspace, rank, center);
 }
 
-void transform_vnlb_channel(StageWorkspace& workspace, Stage stage, int channel,
-                            int similar, bool flat_patch) {
+template <Stage stage>
+void transform_vnlb_channel(StageWorkspace& workspace, int channel, int similar,
+                            bool flat_patch) {
     const int patch_dim = workspace.patch_dim_;
     copy_group_channel_to_samples(workspace.group_noisy_, channel, patch_dim,
                                   similar, workspace.samples_noisy_);
-    if (stage == Stage::Final) {
+    if constexpr (stage == Stage::Final) {
         copy_group_channel_to_samples(workspace.group_basic_, channel,
                                       patch_dim, similar,
                                       workspace.samples_basic_);
     }
 
-    filter_vnlb_samples(workspace, stage, similar, patch_dim, flat_patch);
+    filter_vnlb_samples<stage>(workspace, similar, patch_dim, flat_patch);
     copy_samples_to_group_channel(workspace.filtered_, channel, patch_dim,
                                   similar, workspace.group_noisy_);
 }
 
-void transform_vnlb_coupled(StageWorkspace& workspace, Stage stage, int similar,
+template <Stage stage>
+void transform_vnlb_coupled(StageWorkspace& workspace, int similar,
                             bool flat_patch) {
     const int channels = workspace.geometry_.channels;
     const int patch_dim = workspace.patch_dim_;
     const int sample_dim = channels * patch_dim;
     copy_group_coupled_to_samples(workspace.group_noisy_, channels, patch_dim,
                                   similar, workspace.samples_noisy_);
-    if (stage == Stage::Final) {
+    if constexpr (stage == Stage::Final) {
         copy_group_coupled_to_samples(workspace.group_basic_, channels,
                                       patch_dim, similar,
                                       workspace.samples_basic_);
     }
 
-    filter_vnlb_samples(workspace, stage, similar, sample_dim, flat_patch);
+    filter_vnlb_samples<stage>(workspace, similar, sample_dim, flat_patch);
     copy_samples_to_group_coupled(workspace.filtered_, channels, patch_dim,
                                   similar, workspace.group_noisy_);
 }
 
-void transform_vnlb_coupled_samples(StageWorkspace& workspace, Stage stage,
-                                    int similar) {
+template <Stage stage>
+void transform_vnlb_coupled_samples(StageWorkspace& workspace, int similar) {
     const int channels = workspace.geometry_.channels;
     const int patch_dim = workspace.patch_dim_;
     const int sample_dim = channels * patch_dim;
@@ -771,13 +799,16 @@ void transform_vnlb_coupled_samples(StageWorkspace& workspace, Stage stage,
         return;
     }
 
-    const bool flat_patch = stage == Stage::Final &&
-                            workspace.parameters_.flat_areas &&
-                            is_flat_samples_group(workspace);
-    filter_vnlb_samples(workspace, stage, similar, sample_dim, flat_patch);
+    bool flat_patch = false;
+    if constexpr (stage == Stage::Final) {
+        flat_patch = workspace.parameters_.flat_areas &&
+                     is_flat_samples_group(workspace);
+    }
+    filter_vnlb_samples<stage>(workspace, similar, sample_dim, flat_patch);
 }
 
-void transform_vnlb_group(StageWorkspace& workspace, Stage stage, int similar) {
+template <Stage stage>
+void transform_vnlb_group(StageWorkspace& workspace, int similar) {
     const int channels = workspace.geometry_.channels;
     const int patch_dim = workspace.patch_dim_;
 
@@ -785,16 +816,18 @@ void transform_vnlb_group(StageWorkspace& workspace, Stage stage, int similar) {
         return;
     }
 
-    const bool flat_patch = stage == Stage::Final &&
-                            workspace.parameters_.flat_areas &&
-                            is_flat_group(workspace, similar);
+    bool flat_patch = false;
+    if constexpr (stage == Stage::Final) {
+        flat_patch = workspace.parameters_.flat_areas &&
+                     is_flat_group(workspace, similar);
+    }
 
     if (workspace.parameters_.couple_channels && channels > 1) {
-        transform_vnlb_coupled(workspace, stage, similar, flat_patch);
+        transform_vnlb_coupled<stage>(workspace, similar, flat_patch);
     } else {
         for (int channel = 0; channel < channels; ++channel) {
-            transform_vnlb_channel(workspace, stage, channel, similar,
-                                   flat_patch);
+            transform_vnlb_channel<stage>(workspace, channel, similar,
+                                          flat_patch);
         }
     }
 }
@@ -836,9 +869,9 @@ void compute_spatial_range(VideoGeometry geometry, StageParameters parameters,
 
 [[nodiscard]] bool
 reference_processing_mask_selected(VideoGeometry geometry,
-                                   StageParameters parameters, Stage stage,
-                                   int anchor_frame, int x, int y) noexcept {
-    const int step = normalized_proc_step(stage, parameters);
+                                   StageParameters parameters, int anchor_frame,
+                                   int x, int y) noexcept {
+    const int step = normalized_proc_step(parameters);
     const int max_x = geometry.width - parameters.patch_size;
     const int max_y = geometry.height - parameters.patch_size;
     const int max_frame = geometry.source_frames() - parameters.patch_time;
@@ -853,16 +886,15 @@ reference_processing_mask_selected(VideoGeometry geometry,
 }
 
 void initialize_frame_processing_mask(VideoGeometry geometry,
-                                      StageParameters parameters, Stage stage,
+                                      StageParameters parameters,
                                       int anchor_frame,
                                       std::vector<unsigned char>& mask) {
-    (void)stage;
     mask.assign(static_cast<std::size_t>(geometry.width * geometry.height), 0);
     const int max_x = geometry.width - parameters.patch_size;
     const int max_y = geometry.height - parameters.patch_size;
     for (int y = 0; y <= max_y; ++y) {
         for (int x = 0; x <= max_x; ++x) {
-            if (reference_processing_mask_selected(geometry, parameters, stage,
+            if (reference_processing_mask_selected(geometry, parameters,
                                                    anchor_frame, x, y)) {
                 mask[static_cast<std::size_t>((y * geometry.width) + x)] = 1;
             }
@@ -1739,15 +1771,15 @@ void write_sample_contributions_coupled(
     }
 }
 
-void validate_video_for_stage(ConstVideoView video, StageParameters parameters,
-                              Stage stage) VNLB_INTERNAL_VALIDATION_NOEXCEPT {
+template <Stage stage>
+void validate_video_for_stage(ConstVideoView video, StageParameters parameters)
+    VNLB_INTERNAL_VALIDATION_NOEXCEPT {
 #if VNLB_INTERNAL_VALIDATION_ENABLED
     require(video.has_storage(), "video data pointer must not be null");
-    validate_stage_configuration(video.geometry(), parameters, stage);
+    validate_stage_configuration(video.geometry(), parameters);
 #else
     (void)video;
     (void)parameters;
-    (void)stage;
 #endif
 }
 
@@ -1773,20 +1805,23 @@ void validate_contribution_layout(
 #endif
 }
 
-template <typename FlowProvider, typename ProcessGroupFn>
-ProcessStats
-process_anchor_impl(ConstVideoView noisy, ConstVideoView reference,
-                    int anchor_frame, Stage stage, StageParameters parameters,
-                    const FlowProvider& flow_provider,
-                    aggregate::ContributionStackView contributions,
-                    StageWorkspace& workspace, ProcessGroupFn process_group) {
-    validate_video_for_stage(noisy, parameters, stage);
+template <Stage stage, typename FlowProvider, typename ProcessGroupFn>
+ProcessStats process_anchor_impl(ConstVideoView noisy, ConstVideoView reference,
+                                 int anchor_frame, StageParameters parameters,
+                                 const FlowProvider& flow_provider,
+                                 aggregate::ContributionStackView contributions,
+                                 StageWorkspace& workspace,
+                                 ProcessGroupFn process_group) {
+    validate_video_for_stage<stage>(noisy, parameters);
 #if VNLB_INTERNAL_VALIDATION_ENABLED
-    if (stage == Stage::Final) {
+    if constexpr (stage == Stage::Final) {
         require(noisy.geometry().same_shape(reference.geometry()),
                 "noisy and reference videos must have the same shape");
     }
 #endif
+    if constexpr (stage == Stage::Basic) {
+        (void)reference;
+    }
     validate_contribution_layout(contributions, noisy.geometry(), parameters);
     aggregate::clear_contributions(contributions);
 
@@ -1795,11 +1830,11 @@ process_anchor_impl(ConstVideoView noisy, ConstVideoView reference,
         anchor_frame > geometry.source_frames() - parameters.patch_time) {
         return ProcessStats{};
     }
-    workspace.prepare(geometry, parameters, stage);
+    workspace.prepare<stage>(geometry, parameters);
 
     const int max_x = geometry.width - parameters.patch_size;
     const int max_y = geometry.height - parameters.patch_size;
-    initialize_frame_processing_mask(geometry, parameters, stage, anchor_frame,
+    initialize_frame_processing_mask(geometry, parameters, anchor_frame,
                                      workspace.processing_mask_);
 
     ProcessStats stats{};
@@ -1811,7 +1846,7 @@ process_anchor_impl(ConstVideoView noisy, ConstVideoView reference,
             }
 
             int similar = 0;
-            if (stage == Stage::Basic) {
+            if constexpr (stage == Stage::Basic) {
                 load_reference_patch_basic(noisy, anchor_x, anchor_y,
                                            anchor_frame, parameters, workspace);
                 similar = find_similar_patches(
@@ -1862,7 +1897,7 @@ process_anchor_impl(ConstVideoView noisy, ConstVideoView reference,
 
 } // namespace
 
-void validate_stage_parameters(StageParameters parameters, Stage stage) {
+void validate_stage_parameters(StageParameters parameters) {
     require(parameters.sigma > 0.0F, "sigma must be positive");
     require(parameters.patch_size > 0, "block_size must be positive");
     require(parameters.patch_time > 0, "patch_time must be positive");
@@ -1901,15 +1936,15 @@ void validate_stage_parameters(StageParameters parameters, Stage stage) {
     require(std::isfinite(parameters.membership_noise_floor) &&
                 parameters.membership_noise_floor > 0.0F,
             "membership_noise_floor must be finite and positive");
-    require(normalized_proc_step(stage, parameters) > 0,
+    require(normalized_proc_step(parameters) > 0,
             "block_step must be positive");
     require(!parameters.order_invariance,
             "order-invariant filtering is not implemented yet");
 }
 
 void validate_stage_configuration(VideoGeometry geometry,
-                                  StageParameters parameters, Stage stage) {
-    validate_stage_parameters(parameters, stage);
+                                  StageParameters parameters) {
+    validate_stage_parameters(parameters);
     require(geometry.valid(), "video geometry must be non-empty");
     require(geometry.first_frame >= 0, "first frame must be non-negative");
     require(geometry.source_frames() >= geometry.frames + geometry.first_frame,
@@ -1941,18 +1976,21 @@ FrameRange input_frame_range_for_anchor(VideoGeometry geometry,
     return FrameRange{temporal_low, temporal_high + parameters.patch_time - 1};
 }
 
-void StageWorkspace::prepare(VideoGeometry geometry, StageParameters parameters,
-                             Stage stage) {
+template <Stage stage>
+void StageWorkspace::prepare(VideoGeometry geometry,
+                             StageParameters parameters) {
 #if VNLB_INTERNAL_VALIDATION_ENABLED
-    validate_stage_parameters(parameters, stage);
+    validate_stage_parameters(parameters);
 #endif
 
+    constexpr Stage current_stage = stage;
     const bool geometry_changed = !geometry.same_shape(geometry_);
     const bool buffers_changed =
-        !same_processing_shape(parameters, parameters_) || stage != stage_;
+        !same_processing_shape(parameters, parameters_) ||
+        current_stage != stage_;
     geometry_ = geometry;
     parameters_ = parameters;
-    stage_ = stage;
+    stage_ = current_stage;
     if (!geometry_changed && !buffers_changed) {
         return;
     }
@@ -1982,20 +2020,25 @@ void StageWorkspace::prepare(VideoGeometry geometry, StageParameters parameters,
     prepare_aggregation_window(*this);
 }
 
+template void StageWorkspace::prepare<Stage::Basic>(VideoGeometry,
+                                                    StageParameters);
+template void StageWorkspace::prepare<Stage::Final>(VideoGeometry,
+                                                    StageParameters);
+
 ProcessStats process_basic_anchor_no_flow(
     ConstVideoView noisy, int anchor_frame, StageParameters parameters,
     const flow::SameLocationProvider& flow_provider,
     aggregate::ContributionStackView contributions, StageWorkspace& workspace) {
-    return process_anchor_impl(
-        noisy, ConstVideoView{}, anchor_frame, Stage::Basic, parameters,
-        flow_provider, contributions, workspace, [&](int similar) {
+    return process_anchor_impl<Stage::Basic>(
+        noisy, ConstVideoView{}, anchor_frame, parameters, flow_provider,
+        contributions, workspace, [&](int similar) {
             if (parameters.couple_channels && noisy.geometry().channels > 1) {
                 gather_basic_samples_coupled(noisy, workspace, similar);
-                transform_vnlb_coupled_samples(workspace, Stage::Basic,
-                                               similar);
+                transform_vnlb_coupled_samples<Stage::Basic>(workspace,
+                                                             similar);
             } else {
                 gather_basic_group(noisy, workspace, similar);
-                transform_vnlb_group(workspace, Stage::Basic, similar);
+                transform_vnlb_group<Stage::Basic>(workspace, similar);
             }
         });
 }
@@ -2004,16 +2047,16 @@ ProcessStats process_final_anchor_no_flow(
     ConstVideoView noisy, ConstVideoView basic, int anchor_frame,
     StageParameters parameters, const flow::SameLocationProvider& flow_provider,
     aggregate::ContributionStackView contributions, StageWorkspace& workspace) {
-    return process_anchor_impl(
-        noisy, basic, anchor_frame, Stage::Final, parameters, flow_provider,
-        contributions, workspace, [&](int similar) {
+    return process_anchor_impl<Stage::Final>(
+        noisy, basic, anchor_frame, parameters, flow_provider, contributions,
+        workspace, [&](int similar) {
             if (parameters.couple_channels && noisy.geometry().channels > 1) {
                 gather_final_samples_coupled(noisy, basic, workspace, similar);
-                transform_vnlb_coupled_samples(workspace, Stage::Final,
-                                               similar);
+                transform_vnlb_coupled_samples<Stage::Final>(workspace,
+                                                             similar);
             } else {
                 gather_final_group(noisy, basic, workspace, similar);
-                transform_vnlb_group(workspace, Stage::Final, similar);
+                transform_vnlb_group<Stage::Final>(workspace, similar);
             }
         });
 }
@@ -2022,16 +2065,16 @@ ProcessStats process_basic_anchor_mvtools(
     ConstVideoView noisy, int anchor_frame, StageParameters parameters,
     const flow::MVToolsFlowProvider& flow_provider,
     aggregate::ContributionStackView contributions, StageWorkspace& workspace) {
-    return process_anchor_impl(
-        noisy, ConstVideoView{}, anchor_frame, Stage::Basic, parameters,
-        flow_provider, contributions, workspace, [&](int similar) {
+    return process_anchor_impl<Stage::Basic>(
+        noisy, ConstVideoView{}, anchor_frame, parameters, flow_provider,
+        contributions, workspace, [&](int similar) {
             if (parameters.couple_channels && noisy.geometry().channels > 1) {
                 gather_basic_samples_coupled(noisy, workspace, similar);
-                transform_vnlb_coupled_samples(workspace, Stage::Basic,
-                                               similar);
+                transform_vnlb_coupled_samples<Stage::Basic>(workspace,
+                                                             similar);
             } else {
                 gather_basic_group(noisy, workspace, similar);
-                transform_vnlb_group(workspace, Stage::Basic, similar);
+                transform_vnlb_group<Stage::Basic>(workspace, similar);
             }
         });
 }
@@ -2040,16 +2083,16 @@ ProcessStats process_final_anchor_mvtools(
     ConstVideoView noisy, ConstVideoView basic, int anchor_frame,
     StageParameters parameters, const flow::MVToolsFlowProvider& flow_provider,
     aggregate::ContributionStackView contributions, StageWorkspace& workspace) {
-    return process_anchor_impl(
-        noisy, basic, anchor_frame, Stage::Final, parameters, flow_provider,
-        contributions, workspace, [&](int similar) {
+    return process_anchor_impl<Stage::Final>(
+        noisy, basic, anchor_frame, parameters, flow_provider, contributions,
+        workspace, [&](int similar) {
             if (parameters.couple_channels && noisy.geometry().channels > 1) {
                 gather_final_samples_coupled(noisy, basic, workspace, similar);
-                transform_vnlb_coupled_samples(workspace, Stage::Final,
-                                               similar);
+                transform_vnlb_coupled_samples<Stage::Final>(workspace,
+                                                             similar);
             } else {
                 gather_final_group(noisy, basic, workspace, similar);
-                transform_vnlb_group(workspace, Stage::Final, similar);
+                transform_vnlb_group<Stage::Final>(workspace, similar);
             }
         });
 }

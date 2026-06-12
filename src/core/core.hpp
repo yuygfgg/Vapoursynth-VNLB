@@ -60,8 +60,8 @@ struct PatchMatch {
 
 class StageWorkspace {
   public:
-    void prepare(VideoGeometry geometry, StageParameters parameters,
-                 Stage stage);
+    template <Stage stage>
+    void prepare(VideoGeometry geometry, StageParameters parameters);
 
     VideoGeometry geometry_{};
     StageParameters parameters_{};
@@ -102,9 +102,9 @@ class StageWorkspace {
     bool output_sample_major_ = false;
 };
 
-void validate_stage_parameters(StageParameters parameters, Stage stage);
+void validate_stage_parameters(StageParameters parameters);
 void validate_stage_configuration(VideoGeometry geometry,
-                                  StageParameters parameters, Stage stage);
+                                  StageParameters parameters);
 [[nodiscard]] FrameRange
 input_frame_range_for_anchor(VideoGeometry geometry, StageParameters parameters,
                              int anchor_frame);

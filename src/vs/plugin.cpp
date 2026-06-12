@@ -62,7 +62,6 @@ struct VNLBData {
     VSVideoInfo mvfw_vi{};
     VSVideoInfo mvbw_vi{};
     VSVideoInfo out_vi{};
-    Stage stage = Stage::Basic;
     StageParameters parameters{};
     vnlb::flow::MVToolsAnalysisData mvfw_analysis{};
     vnlb::flow::MVToolsAnalysisData mvbw_analysis{};
@@ -70,10 +69,6 @@ struct VNLBData {
     mutable std::mutex buffer_lock;
     mutable std::unordered_map<std::thread::id, std::unique_ptr<VNLBThreadData>>
         buffer;
-
-    [[nodiscard]] bool uses_mvtools() const noexcept {
-        return mvfw_node != nullptr || mvbw_node != nullptr;
-    }
 };
 
 struct VAggregateData {
@@ -205,11 +200,12 @@ struct FrameListGuard {
     throw std::invalid_argument(std::string(key) + " must be a video node");
 }
 
-[[nodiscard]] StageParameters
-parse_stage_parameters(const VSMap* in, const VSAPI* vsapi, Stage stage) {
+template <Stage stage>
+[[nodiscard]] StageParameters parse_stage_parameters(const VSMap* in,
+                                                     const VSAPI* vsapi) {
     StageParameters parameters{};
     parameters.sigma = map_get_required_sigma_8bit(in, vsapi, "sigma");
-    if (stage == Stage::Final) {
+    if constexpr (stage == Stage::Final) {
         parameters.tau = 400.0F / kEightBitDistanceScale;
         parameters.variance_threshold = 1.7F;
         parameters.flat_areas = true;
@@ -245,7 +241,7 @@ parse_stage_parameters(const VSMap* in, const VSAPI* vsapi, Stage stage) {
         in, vsapi, "variance_threshold", parameters.variance_threshold);
     parameters.proc_step =
         map_get_optional_int(in, vsapi, "block_step", parameters.proc_step);
-    if (stage == Stage::Final) {
+    if constexpr (stage == Stage::Final) {
         parameters.sigma_basic = map_get_optional_sigma_8bit(
             in, vsapi, "sigma_basic", parameters.sigma_basic);
         parameters.gamma =
@@ -419,18 +415,19 @@ void parse_mvtools_grids(const std::vector<const VSFrame*>& vector_frames,
                                                     data->parameters, frame);
 }
 
+template <Stage stage, bool has_mvfw, bool has_mvbw>
 void request_stage_frames(const VNLBData* data, int frame,
                           VSFrameContext* frame_ctx, const VSAPI* vsapi) {
     const FrameRange range = required_stage_frames(data, frame);
     for (int needed = range.first; needed <= range.last; ++needed) {
         vsapi->requestFrameFilter(needed, data->node, frame_ctx);
-        if (data->stage == Stage::Final) {
+        if constexpr (stage == Stage::Final) {
             vsapi->requestFrameFilter(needed, data->ref_node, frame_ctx);
         }
-        if (data->mvfw_node != nullptr) {
+        if constexpr (has_mvfw) {
             vsapi->requestFrameFilter(needed, data->mvfw_node, frame_ctx);
         }
-        if (data->mvbw_node != nullptr) {
+        if constexpr (has_mvbw) {
             vsapi->requestFrameFilter(needed, data->mvbw_node, frame_ctx);
         }
     }
@@ -449,10 +446,10 @@ void append_frame_planes(const VSFrame* frame, int channels,
     }
 }
 
-[[nodiscard]] const VSFrame* render_stage_frame(int frame, VNLBData* data,
-                                                VSFrameContext* frame_ctx,
-                                                VSCore* core,
-                                                const VSAPI* vsapi) {
+template <Stage stage, bool has_mvfw, bool has_mvbw>
+[[nodiscard]] const VSFrame*
+render_stage_frame(int frame, VNLBData* data, VSFrameContext* frame_ctx,
+                   VSCore* core, const VSAPI* vsapi) {
     VNLBThreadData& thread_data = thread_data_for(data);
     const VideoGeometry geometry = make_geometry(data->vi);
     const auto layout = vnlb::aggregate::make_contribution_layout(
@@ -506,7 +503,7 @@ void append_frame_planes(const VSFrame* frame, int channels,
             append_frame_planes(clip_frame, channels, thread_data.clip_planes,
                                 vsapi);
 
-            if (data->stage == Stage::Final) {
+            if constexpr (stage == Stage::Final) {
                 const VSFrame* ref_frame =
                     vsapi->getFrameFilter(needed, data->ref_node, frame_ctx);
                 thread_data.ref_frames.push_back(ref_frame);
@@ -514,11 +511,11 @@ void append_frame_planes(const VSFrame* frame, int channels,
                                     vsapi);
             }
 
-            if (data->mvfw_node != nullptr) {
+            if constexpr (has_mvfw) {
                 thread_data.mvfw_frames.push_back(
                     vsapi->getFrameFilter(needed, data->mvfw_node, frame_ctx));
             }
-            if (data->mvbw_node != nullptr) {
+            if constexpr (has_mvbw) {
                 thread_data.mvbw_frames.push_back(
                     vsapi->getFrameFilter(needed, data->mvbw_node, frame_ctx));
             }
@@ -530,15 +527,15 @@ void append_frame_planes(const VSFrame* frame, int channels,
             std::span<const ConstPlaneView>(thread_data.clip_planes),
             local_geometry);
 
-        if (data->uses_mvtools()) {
-            if (data->mvfw_node != nullptr) {
+        if constexpr (has_mvfw || has_mvbw) {
+            if constexpr (has_mvfw) {
                 parse_mvtools_grids(
                     thread_data.mvfw_frames, thread_data.clip_frames,
                     data->mvfw_analysis, thread_data.mvfw_grids, vsapi);
             } else {
                 thread_data.mvfw_grids.clear();
             }
-            if (data->mvbw_node != nullptr) {
+            if constexpr (has_mvbw) {
                 parse_mvtools_grids(
                     thread_data.mvbw_frames, thread_data.clip_frames,
                     data->mvbw_analysis, thread_data.mvbw_grids, vsapi);
@@ -553,7 +550,7 @@ void append_frame_planes(const VSFrame* frame, int channels,
                 std::span<const vnlb::flow::MVToolsVectorGrid>(
                     thread_data.mvbw_grids),
                 range.first);
-            if (data->stage == Stage::Basic) {
+            if constexpr (stage == Stage::Basic) {
                 vnlb::core::process_basic_anchor_mvtools(
                     clip_view, frame, data->parameters, flow_provider,
                     contributions, thread_data.workspace);
@@ -567,7 +564,7 @@ void append_frame_planes(const VSFrame* frame, int channels,
             }
         } else {
             const vnlb::flow::SameLocationProvider flow_provider;
-            if (data->stage == Stage::Basic) {
+            if constexpr (stage == Stage::Basic) {
                 vnlb::core::process_basic_anchor_no_flow(
                     clip_view, frame, data->parameters, flow_provider,
                     contributions, thread_data.workspace);
@@ -586,6 +583,7 @@ void append_frame_planes(const VSFrame* frame, int channels,
     return out;
 }
 
+template <Stage stage, bool has_mvfw, bool has_mvbw>
 const VSFrame* VS_CC VNLBGetFrame(int n, int activationReason,
                                   void* instanceData,
                                   [[maybe_unused]] void** frameData,
@@ -596,11 +594,14 @@ const VSFrame* VS_CC VNLBGetFrame(int n, int activationReason,
         if (activationReason == arInitial) {
             const FrameRange range = required_stage_frames(data, n);
             if (range.last < range.first) {
-                return render_stage_frame(n, data, frameCtx, core, vsapi);
+                return render_stage_frame<stage, has_mvfw, has_mvbw>(
+                    n, data, frameCtx, core, vsapi);
             }
-            request_stage_frames(data, n, frameCtx, vsapi);
+            request_stage_frames<stage, has_mvfw, has_mvbw>(data, n, frameCtx,
+                                                            vsapi);
         } else if (activationReason == arAllFramesReady) {
-            return render_stage_frame(n, data, frameCtx, core, vsapi);
+            return render_stage_frame<stage, has_mvfw, has_mvbw>(
+                n, data, frameCtx, core, vsapi);
         }
     } catch (const std::exception& error) {
         const std::string message = std::string("VNLB: ") + error.what();
@@ -626,8 +627,53 @@ void VS_CC VNLBFree(void* instanceData, [[maybe_unused]] VSCore* core,
     }
 }
 
-void VNLBCreate(const VSMap* in, VSMap* out, VSCore* core, const VSAPI* vsapi,
-                Stage stage) {
+template <Stage stage>
+[[nodiscard]] constexpr const char* vnlb_filter_name() noexcept {
+    if constexpr (stage == Stage::Basic) {
+        return "VNLB Basic";
+    }
+    return "VNLB Final";
+}
+
+template <Stage stage, bool has_mvfw, bool has_mvbw>
+void create_bound_vnlb_filter(VSMap* out, VSCore* core, const VSAPI* vsapi,
+                              std::unique_ptr<VNLBData>& data,
+                              const std::array<VSFilterDependency, 4>& deps,
+                              int dep_count) {
+    vsapi->createVideoFilter(out, vnlb_filter_name<stage>(), &data->out_vi,
+                             VNLBGetFrame<stage, has_mvfw, has_mvbw>, VNLBFree,
+                             fmParallel, deps.data(), dep_count, data.release(),
+                             core);
+}
+
+template <Stage stage>
+void create_bound_vnlb_filter(VSMap* out, VSCore* core, const VSAPI* vsapi,
+                              std::unique_ptr<VNLBData>& data,
+                              const std::array<VSFilterDependency, 4>& deps,
+                              int dep_count) {
+    const bool has_mvfw = data->mvfw_node != nullptr;
+    const bool has_mvbw = data->mvbw_node != nullptr;
+    if (has_mvfw) {
+        if (has_mvbw) {
+            create_bound_vnlb_filter<stage, true, true>(out, core, vsapi, data,
+                                                        deps, dep_count);
+            return;
+        }
+        create_bound_vnlb_filter<stage, true, false>(out, core, vsapi, data,
+                                                     deps, dep_count);
+        return;
+    }
+    if (has_mvbw) {
+        create_bound_vnlb_filter<stage, false, true>(out, core, vsapi, data,
+                                                     deps, dep_count);
+        return;
+    }
+    create_bound_vnlb_filter<stage, false, false>(out, core, vsapi, data, deps,
+                                                  dep_count);
+}
+
+template <Stage stage>
+void VNLBCreate(const VSMap* in, VSMap* out, VSCore* core, const VSAPI* vsapi) {
     auto data = std::make_unique<VNLBData>();
     try {
         int error = peSuccess;
@@ -641,8 +687,7 @@ void VNLBCreate(const VSMap* in, VSMap* out, VSCore* core, const VSAPI* vsapi,
                 "only constant GrayS and YUV444PS clips are supported");
         }
 
-        data->stage = stage;
-        if (stage == Stage::Final) {
+        if constexpr (stage == Stage::Final) {
             data->ref_node = vsapi->mapGetNode(in, "ref", 0, &error);
             if (error != peSuccess) {
                 throw std::invalid_argument("ref must be a video node");
@@ -678,9 +723,9 @@ void VNLBCreate(const VSMap* in, VSMap* out, VSCore* core, const VSAPI* vsapi,
             data->mvbw_vi = *mvbw_vi;
         }
 
-        data->parameters = parse_stage_parameters(in, vsapi, stage);
+        data->parameters = parse_stage_parameters<stage>(in, vsapi);
         vnlb::core::validate_stage_configuration(make_geometry(*vi),
-                                                 data->parameters, stage);
+                                                 data->parameters);
         data->slot_count = slot_count(data->parameters);
         data->vi = *vi;
         data->out_vi = *vi;
@@ -693,7 +738,7 @@ void VNLBCreate(const VSMap* in, VSMap* out, VSCore* core, const VSAPI* vsapi,
         std::array<VSFilterDependency, 4> deps{};
         int dep_count = 0;
         deps[static_cast<std::size_t>(dep_count++)] = {data->node, rpGeneral};
-        if (data->stage == Stage::Final) {
+        if constexpr (stage == Stage::Final) {
             deps[static_cast<std::size_t>(dep_count++)] = {data->ref_node,
                                                            rpGeneral};
         }
@@ -705,10 +750,8 @@ void VNLBCreate(const VSMap* in, VSMap* out, VSCore* core, const VSAPI* vsapi,
             deps[static_cast<std::size_t>(dep_count++)] = {data->mvbw_node,
                                                            rpGeneral};
         }
-        vsapi->createVideoFilter(
-            out, stage == Stage::Basic ? "VNLB Basic" : "VNLB Final",
-            &data->out_vi, VNLBGetFrame, VNLBFree, fmParallel, deps.data(),
-            dep_count, data.release(), core);
+        create_bound_vnlb_filter<stage>(out, core, vsapi, data, deps,
+                                        dep_count);
     } catch (const std::exception& error) {
         if (data) {
             VNLBFree(data.release(), core, vsapi);
@@ -918,13 +961,13 @@ void VS_CC VAggregateCreate(const VSMap* in, VSMap* out,
 void VS_CC BasicCreate(const VSMap* in, VSMap* out,
                        [[maybe_unused]] void* userData, VSCore* core,
                        const VSAPI* vsapi) {
-    VNLBCreate(in, out, core, vsapi, Stage::Basic);
+    VNLBCreate<Stage::Basic>(in, out, core, vsapi);
 }
 
 void VS_CC FinalCreate(const VSMap* in, VSMap* out,
                        [[maybe_unused]] void* userData, VSCore* core,
                        const VSAPI* vsapi) {
-    VNLBCreate(in, out, core, vsapi, Stage::Final);
+    VNLBCreate<Stage::Final>(in, out, core, vsapi);
 }
 
 } // namespace
