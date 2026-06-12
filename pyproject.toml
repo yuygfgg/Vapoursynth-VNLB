@@ -10,7 +10,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vapoursynth-vnlb"
-version = "0.4.0"
+version = "0.5.0"
 description = "Video Non-Local Bayes denoising plugin for VapourSynth"
 readme = "README.md"
 requires-python = ">=3.12"

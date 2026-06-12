@@ -9,7 +9,6 @@ import shutil
 import zipfile
 from pathlib import Path
 
-
 SYSTEM_DLL_EXCLUDE = {
     "api-ms-*.dll",
     "concrt*.dll",
@@ -94,7 +93,9 @@ def repair_windows_wheel(
     )
 
     plugin_dir = plugin_dll.parent
-    for dependency in sorted(dependency_paths, key=lambda item: Path(item).name.lower()):
+    for dependency in sorted(
+        dependency_paths, key=lambda item: Path(item).name.lower()
+    ):
         source = Path(dependency)
         target = plugin_dir / source.name
         if source.resolve() != target.resolve():
