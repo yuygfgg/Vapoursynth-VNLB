@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <limits>
 #include <span>
 #include <stdexcept>
@@ -102,8 +103,8 @@ void copy_float_row(const float* VNLB_RESTRICT source,
     if (count <= 0) {
         return;
     }
-    linalg::kernels::copy_contiguous_highway(source, destination,
-                                             static_cast<std::size_t>(count));
+    std::memcpy(destination, source,
+                static_cast<std::size_t>(count) * sizeof(float));
 }
 
 [[nodiscard]] bool group_is_equal(const std::vector<float>& group, int channels,
@@ -488,10 +489,13 @@ void copy_samples_to_group_coupled(const linalg::Matrix<float>& samples,
 void copy_samples(linalg::ConstMatrixView<float> input,
                   linalg::Matrix<float>& output) {
     output.resize(input.rows(), input.cols());
+    if (input.cols() == 0) {
+        return;
+    }
     for (std::size_t row = 0; row < input.rows(); ++row) {
         const float* VNLB_RESTRICT input_row = input.row_data(row);
         float* VNLB_RESTRICT output_row = output.row_data(row);
-        std::copy_n(input_row, input.cols(), output_row);
+        std::memcpy(output_row, input_row, input.cols() * sizeof(float));
     }
 }
 
@@ -718,9 +722,11 @@ void filter_vnlb_samples(StageWorkspace& workspace, int similar, int sample_dim,
                 center = mean_basic;
             }
         }
-        for (std::size_t row = 0; row < workspace.filtered_.rows(); ++row) {
-            std::copy(center.begin(), center.end(),
-                      workspace.filtered_.row_data(row));
+        if (!center.empty()) {
+            for (std::size_t row = 0; row < workspace.filtered_.rows(); ++row) {
+                std::memcpy(workspace.filtered_.row_data(row), center.data(),
+                            center.size() * sizeof(float));
+            }
         }
         const linalg::ConstMatrixView<float> membership_centered = [&]() {
             if constexpr (stage == Stage::Final) {

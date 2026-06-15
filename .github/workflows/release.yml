@@ -182,8 +182,18 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Build Windows dependencies
+      - name: Restore Windows dependency cache
         if: runner.os == 'Windows'
+        id: cache-windows-deps
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            C:/highway
+            C:/openblas
+          key: windows-deps-v1-${{ runner.os }}-msys2-mingw64-highway-1.4.0-openblas-0.3.33-core2-threaded
+
+      - name: Build Windows dependencies
+        if: runner.os == 'Windows' && steps.cache-windows-deps.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -eu
@@ -240,6 +250,23 @@ jobs:
             USE_OPENMP=0 \
             NO_SHARED=0 \
             install
+
+      - name: Verify Windows dependencies
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -eu
+          test -f /c/openblas/bin/libopenblas.dll
+          test -d /c/highway/lib/cmake/hwy
+
+      - name: Save Windows dependency cache
+        if: runner.os == 'Windows' && steps.cache-windows-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            C:/highway
+            C:/openblas
+          key: ${{ steps.cache-windows-deps.outputs.cache-primary-key }}
 
       - name: Install macOS dependencies
         if: runner.os == 'macOS'

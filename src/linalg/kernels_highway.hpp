@@ -121,32 +121,6 @@ center_row_highway(const T* VNLB_RESTRICT input, const T* VNLB_RESTRICT mean,
 }
 
 template <std::floating_point T>
-inline void copy_contiguous_highway(const T* VNLB_RESTRICT input,
-                                    T* VNLB_RESTRICT output,
-                                    std::size_t count) noexcept {
-    namespace hn = hwy::HWY_NAMESPACE;
-    const hn::ScalableTag<T> d;
-    const std::size_t lanes = hn::Lanes(d);
-
-    std::size_t index = 0;
-    if (count == lanes) {
-        hn::StoreU(hn::LoadU(d, input), d, output);
-        return;
-    }
-    if (count == (2 * lanes)) {
-        hn::StoreU(hn::LoadU(d, input), d, output);
-        hn::StoreU(hn::LoadU(d, input + lanes), d, output + lanes);
-        return;
-    }
-    for (; index + lanes <= count; index += lanes) {
-        hn::StoreU(hn::LoadU(d, input + index), d, output + index);
-    }
-    for (; index < count; ++index) {
-        output[index] = input[index];
-    }
-}
-
-template <std::floating_point T>
 inline void add_contiguous_highway(T* VNLB_RESTRICT output,
                                    const T* VNLB_RESTRICT input,
                                    std::size_t count) noexcept {

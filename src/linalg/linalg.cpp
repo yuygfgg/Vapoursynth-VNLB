@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -139,10 +140,13 @@ template <Real T>
 void copy_matrix(ConstMatrixView<T> source, MatrixView<T> destination) {
     require_same_shape(source, destination,
                        "destination matrix shape must match source");
+    if (source.cols() == 0) {
+        return;
+    }
     for (std::size_t row = 0; row < source.rows(); ++row) {
         const T* VNLB_RESTRICT source_row = source.row_data(row);
         T* VNLB_RESTRICT destination_row = destination.row_data(row);
-        std::copy_n(source_row, source.cols(), destination_row);
+        std::memcpy(destination_row, source_row, source.cols() * sizeof(T));
     }
 }
 
@@ -631,7 +635,9 @@ void project_low_rank(ConstMatrixView<T> samples, std::span<const T> mean,
     for (std::size_t sample = 0; sample < samples.rows(); ++sample) {
         const T* VNLB_RESTRICT sample_row = samples.row_data(sample);
         T* VNLB_RESTRICT output_row = output.row_data(sample);
-        std::copy(mean.begin(), mean.end(), output_row);
+        if (!mean.empty()) {
+            std::memcpy(output_row, mean.data(), mean.size() * sizeof(T));
+        }
 
         for (std::size_t basis = 0; basis < rank; ++basis) {
             const T* VNLB_RESTRICT basis_row = basis_vectors.row_data(basis);

@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -62,9 +63,12 @@ template <Real T> void mirror_upper_to_lower(MatrixView<T> matrix) {
 
 template <Real T>
 void copy_matrix(ConstMatrixView<T> source, MatrixView<T> destination) {
+    if (source.cols() == 0) {
+        return;
+    }
     for (std::size_t row = 0; row < source.rows(); ++row) {
-        std::copy_n(source.row_data(row), source.cols(),
-                    destination.row_data(row));
+        std::memcpy(destination.row_data(row), source.row_data(row),
+                    source.cols() * sizeof(T));
     }
 }
 
