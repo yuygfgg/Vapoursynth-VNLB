@@ -163,6 +163,21 @@ vnlb::core::StageParameters constant_test_parameters() {
     return parameters;
 }
 
+void test_stage_configuration_allows_large_streamed_clip() {
+    auto parameters = constant_test_parameters();
+    parameters.patch_time = 1;
+
+    const vnlb::core::VideoGeometry geometry{1920, 1080, 400, 3};
+    require(geometry.frame_samples() <= std::numeric_limits<int>::max(),
+            "test frame sample count should fit int");
+    require(geometry.sample_count() >
+                static_cast<std::size_t>(std::numeric_limits<int>::max()),
+            "test video sample count should exceed int");
+
+    vnlb::core::StageWorkspace workspace;
+    workspace.prepare<vnlb::core::Stage::Basic>(geometry, parameters);
+}
+
 void test_stage_parameter_validation_rejects_invalid_medium_inputs() {
     const auto valid = constant_test_parameters();
     vnlb::core::validate_stage_parameters(valid);
@@ -379,6 +394,7 @@ int main() {
     test_aggregate_frame();
     test_stage_parameter_defaults();
     test_checked_geometry_rejects_overflow();
+    test_stage_configuration_allows_large_streamed_clip();
     test_stage_parameter_validation_rejects_invalid_medium_inputs();
     test_workspace_uses_retained_group_capacity();
     test_basic_constant_pipeline();

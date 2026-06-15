@@ -36,9 +36,11 @@ struct VideoGeometry {
         return common::checked_mul_int(
             plane_pixels(), channels, "video frame sample count overflows int");
     }
-    [[nodiscard]] int sample_count() const {
-        return common::checked_mul_int(frame_samples(), frames,
-                                       "video sample count overflows int");
+    [[nodiscard]] std::size_t sample_count() const {
+        return common::checked_mul_size(
+            static_cast<std::size_t>(frame_samples()),
+            static_cast<std::size_t>(frames),
+            "video sample count overflows size_t");
     }
     [[nodiscard]] int source_frames() const noexcept {
         return total_frames > 0 ? total_frames : frames;
@@ -56,7 +58,7 @@ struct VideoGeometry {
             throw std::invalid_argument("video geometry must be non-empty");
         }
 
-        return static_cast<std::size_t>(sample_count());
+        return sample_count();
     }
 
     [[nodiscard]] int local_frame(int frame) const noexcept {
