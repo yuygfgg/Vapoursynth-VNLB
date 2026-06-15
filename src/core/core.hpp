@@ -36,8 +36,6 @@ struct StageParameters {
     float weight_epsilon = 1.0e-6F;
     float membership_noise_floor = 0.25F;
     int proc_step = 8;
-    bool aggregation_window = false;
-    bool order_invariance = false;
     bool flat_areas = false;
     bool couple_channels = true;
 };

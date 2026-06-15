@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/arithmetic.hpp"
 #include "common/validation.hpp"
 #include "core/video.hpp"
 
@@ -23,28 +24,49 @@ struct ContributionLayout {
     int patch_time = 0;
     int slot_count = 0;
 
-    [[nodiscard]] int plane_pixels() const noexcept { return width * height; }
-    [[nodiscard]] int slot_stride() const noexcept {
-        return (channels + 1) * plane_pixels();
+    [[nodiscard]] int plane_pixels() const {
+        return common::checked_mul_int(
+            width, height, "contribution plane pixel count overflows int");
     }
-    [[nodiscard]] int weight_plane_offset(int slot) const noexcept {
-        return (slot * slot_stride()) + (channels * plane_pixels());
+    [[nodiscard]] int slot_stride() const {
+        return common::checked_mul_int(
+            common::checked_add_int(channels, 1,
+                                    "contribution channel count overflows int"),
+            plane_pixels(), "contribution slot stride overflows int");
     }
-    [[nodiscard]] int numerator_plane_offset(int slot,
-                                             int channel) const noexcept {
-        return (slot * slot_stride()) + (channel * plane_pixels());
+    [[nodiscard]] int weight_plane_offset(int slot) const {
+        return common::checked_add_int(
+            common::checked_mul_int(slot, slot_stride(),
+                                    "contribution slot offset overflows int"),
+            common::checked_mul_int(
+                channels, plane_pixels(),
+                "contribution weight plane offset overflows int"),
+            "contribution weight plane offset overflows int");
     }
-    [[nodiscard]] int slot_for_output_offset(int output_offset) const noexcept {
-        return output_offset + search_bwd;
+    [[nodiscard]] int numerator_plane_offset(int slot, int channel) const {
+        return common::checked_add_int(
+            common::checked_mul_int(slot, slot_stride(),
+                                    "contribution slot offset overflows int"),
+            common::checked_mul_int(
+                channel, plane_pixels(),
+                "contribution numerator plane offset overflows int"),
+            "contribution numerator plane offset overflows int");
+    }
+    [[nodiscard]] int slot_for_output_offset(int output_offset) const {
+        return common::checked_add_int(output_offset, search_bwd,
+                                       "contribution slot index overflows int");
     }
     [[nodiscard]] bool
     contains_output_offset(int output_offset) const noexcept {
-        const int slot = slot_for_output_offset(output_offset);
-        return slot >= 0 && slot < slot_count;
+        const auto slot = static_cast<long long>(output_offset) +
+                          static_cast<long long>(search_bwd);
+        return slot >= 0 && slot < static_cast<long long>(slot_count);
     }
-    [[nodiscard]] std::size_t value_count() const noexcept {
-        return static_cast<std::size_t>(slot_count) *
-               static_cast<std::size_t>(slot_stride());
+    [[nodiscard]] std::size_t value_count() const {
+        return common::checked_mul_size(
+            static_cast<std::size_t>(slot_count),
+            static_cast<std::size_t>(slot_stride()),
+            "contribution stack size overflows size_t");
     }
 };
 
@@ -75,24 +97,27 @@ class ConstContributionStackView {
         return layout_;
     }
 
-    [[nodiscard]] float numerator(int slot, int channel, int x,
-                                  int y) const noexcept {
+    [[nodiscard]] float numerator(int slot, int channel, int x, int y) const {
         if (planes_ != nullptr) {
             const auto plane = planes_[channel];
-            return plane
-                .data[(((slot * 2 * layout_.height) + y) * plane.stride) + x];
+            return plane.data[(((static_cast<std::ptrdiff_t>(slot) * 2 *
+                                 layout_.height) +
+                                y) *
+                               plane.stride) +
+                              x];
         }
         const int plane = layout_.numerator_plane_offset(slot, channel);
         return data_[plane + (y * layout_.width) + x];
     }
 
-    [[nodiscard]] float weight(int slot, int x, int y) const noexcept {
+    [[nodiscard]] float weight(int slot, int x, int y) const {
         if (planes_ != nullptr) {
             const auto plane = planes_[0];
-            return plane
-                .data[(((slot * 2 * layout_.height) + layout_.height + y) *
-                       plane.stride) +
-                      x];
+            return plane.data[(((static_cast<std::ptrdiff_t>(slot) * 2 *
+                                 layout_.height) +
+                                layout_.height + y) *
+                               plane.stride) +
+                              x];
         }
         const int plane = layout_.weight_plane_offset(slot);
         return data_[plane + (y * layout_.width) + x];
@@ -128,57 +153,63 @@ class ContributionStackView {
         return planes_ != nullptr;
     }
 
-    [[nodiscard]] float& numerator(int slot, int channel, int x,
-                                   int y) const noexcept {
+    [[nodiscard]] float& numerator(int slot, int channel, int x, int y) const {
         if (planes_ != nullptr) {
             const auto plane = planes_[channel];
-            return plane
-                .data[(((slot * 2 * layout_.height) + y) * plane.stride) + x];
+            return plane.data[(((static_cast<std::ptrdiff_t>(slot) * 2 *
+                                 layout_.height) +
+                                y) *
+                               plane.stride) +
+                              x];
         }
         const int plane = layout_.numerator_plane_offset(slot, channel);
         return data_[plane + (y * layout_.width) + x];
     }
 
-    [[nodiscard]] float& weight(int slot, int x, int y) const noexcept {
+    [[nodiscard]] float& weight(int slot, int x, int y) const {
         if (planes_ != nullptr) {
             const auto plane = planes_[0];
-            return plane
-                .data[(((slot * 2 * layout_.height) + layout_.height + y) *
-                       plane.stride) +
-                      x];
+            return plane.data[(((static_cast<std::ptrdiff_t>(slot) * 2 *
+                                 layout_.height) +
+                                layout_.height + y) *
+                               plane.stride) +
+                              x];
         }
         const int plane = layout_.weight_plane_offset(slot);
         return data_[plane + (y * layout_.width) + x];
     }
 
     [[nodiscard]] float& channel_weight(int slot, int channel, int x,
-                                        int y) const noexcept {
+                                        int y) const {
         if (planes_ != nullptr) {
             const auto plane = planes_[channel];
-            return plane
-                .data[(((slot * 2 * layout_.height) + layout_.height + y) *
-                       plane.stride) +
-                      x];
+            return plane.data[(((static_cast<std::ptrdiff_t>(slot) * 2 *
+                                 layout_.height) +
+                                layout_.height + y) *
+                               plane.stride) +
+                              x];
         }
         return weight(slot, x, y);
     }
 
-    [[nodiscard]] float* numerator_row(int slot, int channel,
-                                       int y) const noexcept {
+    [[nodiscard]] float* numerator_row(int slot, int channel, int y) const {
         if (planes_ != nullptr) {
             const auto plane = planes_[channel];
             return plane.data +
-                   (((slot * 2 * layout_.height) + y) * plane.stride);
+                   (((static_cast<std::ptrdiff_t>(slot) * 2 * layout_.height) +
+                     y) *
+                    plane.stride);
         }
         const int plane = layout_.numerator_plane_offset(slot, channel);
         return data_ + plane + (y * layout_.width);
     }
 
-    [[nodiscard]] float* weight_row(int slot, int y) const noexcept {
+    [[nodiscard]] float* weight_row(int slot, int y) const {
         if (planes_ != nullptr) {
             const auto plane = planes_[0];
             return plane.data +
-                   (((slot * 2 * layout_.height) + layout_.height + y) *
+                   (((static_cast<std::ptrdiff_t>(slot) * 2 * layout_.height) +
+                     layout_.height + y) *
                     plane.stride);
         }
         const int plane = layout_.weight_plane_offset(slot);
@@ -186,17 +217,18 @@ class ContributionStackView {
     }
 
     [[nodiscard]] float* channel_weight_row(int slot, int channel,
-                                            int y) const noexcept {
+                                            int y) const {
         if (planes_ != nullptr) {
             const auto plane = planes_[channel];
             return plane.data +
-                   (((slot * 2 * layout_.height) + layout_.height + y) *
+                   (((static_cast<std::ptrdiff_t>(slot) * 2 * layout_.height) +
+                     layout_.height + y) *
                     plane.stride);
         }
         return weight_row(slot, y);
     }
 
-    void add_weight(int slot, int x, int y, float value) const noexcept {
+    void add_weight(int slot, int x, int y, float value) const {
         if (planes_ != nullptr) {
             for (int channel = 0; channel < layout_.channels; ++channel) {
                 channel_weight(slot, channel, x, y) += value;
@@ -250,8 +282,7 @@ class ContributionStack {
     std::vector<float> storage_;
 };
 
-void clear_contributions(ContributionStackView stack)
-    VNLB_INTERNAL_VALIDATION_NOEXCEPT;
+void clear_contributions(ContributionStackView stack);
 
 void aggregate_frame(std::span<const ConstContributionStackView> stacks,
                      std::span<const int> anchor_frames, int output_frame,

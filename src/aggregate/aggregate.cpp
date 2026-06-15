@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <limits>
 #include <stdexcept>
 
 namespace vnlb::aggregate {
@@ -21,18 +22,23 @@ void require_valid_layout(ContributionLayout layout) {
     require(layout.search_bwd >= 0 && layout.search_fwd >= 0 &&
                 layout.patch_time > 0,
             "contribution temporal parameters are invalid");
-    require(layout.slot_count ==
-                layout.search_bwd + layout.search_fwd + layout.patch_time,
+    const int expected_slot_count = common::checked_add_int(
+        common::checked_add_int(layout.search_bwd, layout.search_fwd,
+                                "contribution slot count overflows int"),
+        layout.patch_time, "contribution slot count overflows int");
+    require(layout.slot_count == expected_slot_count,
             "contribution slot count does not match temporal parameters");
+    require(layout.value_count() <=
+                static_cast<std::size_t>(std::numeric_limits<int>::max()),
+            "contribution stack size overflows int");
+    (void)common::checked_mul_int(
+        common::checked_mul_int(layout.slot_count, 2,
+                                "contribution frame height overflows int"),
+        layout.height, "contribution frame height overflows int");
 }
 
-void validate_layout(ContributionLayout layout)
-    VNLB_INTERNAL_VALIDATION_NOEXCEPT {
-#if VNLB_INTERNAL_VALIDATION_ENABLED
+void validate_layout(ContributionLayout layout) {
     require_valid_layout(layout);
-#else
-    (void)layout;
-#endif
 }
 
 } // namespace
@@ -48,7 +54,10 @@ ContributionLayout make_contribution_layout(core::VideoGeometry geometry,
     layout.search_bwd = search_bwd;
     layout.search_fwd = search_fwd;
     layout.patch_time = patch_time;
-    layout.slot_count = search_bwd + search_fwd + patch_time;
+    layout.slot_count = common::checked_add_int(
+        common::checked_add_int(search_bwd, search_fwd,
+                                "contribution slot count overflows int"),
+        patch_time, "contribution slot count overflows int");
     require_valid_layout(layout);
     return layout;
 }
@@ -63,8 +72,7 @@ void ContributionStack::clear() {
     std::fill(storage_.begin(), storage_.end(), 0.0F);
 }
 
-void clear_contributions(ContributionStackView stack)
-    VNLB_INTERNAL_VALIDATION_NOEXCEPT {
+void clear_contributions(ContributionStackView stack) {
     const auto layout = stack.layout();
     validate_layout(layout);
     if (stack.data() != nullptr) {

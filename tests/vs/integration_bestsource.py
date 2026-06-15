@@ -93,6 +93,69 @@ def assert_basic_rejects_final_only_params(core: vs.Core) -> None:
         raise AssertionError(f"Basic accepted final-only parameter {name!r}")
 
 
+def assert_directional_temporal_args_override_radius(core: vs.Core) -> None:
+    clip = core.std.BlankClip(format=vs.GRAYS, width=16, height=16, length=1, color=0)
+    stack = core.vnlb.Basic(
+        clip,
+        sigma=5.1,
+        block_size=2,
+        patch_time=1,
+        bm_range=1,
+        radius=9,
+        search_bwd=0,
+        search_fwd=0,
+        group_size=8,
+        rank=4,
+        block_step=2,
+    )
+    if stack.height != clip.height * 2:
+        raise AssertionError("directional temporal args did not override radius")
+
+    aggregated = core.vnlb.Aggregate(
+        stack,
+        src=clip,
+        patch_time=1,
+        radius=9,
+        search_bwd=0,
+        search_fwd=0,
+    )
+    aggregated.get_frame(0)
+
+
+def assert_basic_rejects_invalid_params(core: vs.Core) -> None:
+    clip = core.std.BlankClip(format=vs.GRAYS, width=16, height=16, length=1, color=0)
+    invalid_params = {
+        "sigma": float("inf"),
+        "beta": float("inf"),
+        "tau": float("inf"),
+        "variance_threshold": float("inf"),
+        "weight_alpha": float("inf"),
+        "weight_beta": float("inf"),
+        "weight_gamma": float("inf"),
+        "weight_epsilon": float("inf"),
+        "membership_noise_floor": float("inf"),
+        "block_step": -1,
+    }
+    for name, value in invalid_params.items():
+        params = {
+            "sigma": 5.1,
+            "block_size": 2,
+            "patch_time": 1,
+            "bm_range": 1,
+            "radius": 0,
+            "group_size": 8,
+            "rank": 4,
+            "block_step": 2,
+            name: value,
+        }
+        try:
+            stack = core.vnlb.Basic(clip, **params)
+            stack.get_frame(0)
+        except vs.Error:
+            continue
+        raise AssertionError(f"Basic accepted invalid parameter {name!r}")
+
+
 def build_cases(
     core: vs.Core, source_root: Path, cache_dir: Path
 ) -> dict[str, np.ndarray]:
@@ -122,12 +185,8 @@ def build_cases(
     )
 
     return {
-        "image_gray": run_chain(
-            core, image_gray, patch_time=1, radius=0, frames=(0,)
-        ),
-        "image_yuv444": run_chain(
-            core, image_yuv, patch_time=1, radius=0, frames=(0,)
-        ),
+        "image_gray": run_chain(core, image_gray, patch_time=1, radius=0, frames=(0,)),
+        "image_yuv444": run_chain(core, image_yuv, patch_time=1, radius=0, frames=(0,)),
         "image_yuv444_chroma": run_chain(
             core, image_yuv, patch_time=1, radius=0, frames=(0,), chroma=True
         ),
@@ -196,6 +255,8 @@ def main() -> int:
     core = vs.core
     core.std.LoadPlugin(path=str(plugin_path))
     assert_basic_rejects_final_only_params(core)
+    assert_directional_temporal_args_override_radius(core)
+    assert_basic_rejects_invalid_params(core)
     actual = build_cases(core, source_root, cache_dir)
 
     if update:

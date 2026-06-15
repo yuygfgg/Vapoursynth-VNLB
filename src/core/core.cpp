@@ -1,5 +1,6 @@
 #include "core.hpp"
 
+#include "common/arithmetic.hpp"
 #include "common/compiler.hpp"
 #include "common/validation.hpp"
 #include "distance_highway.hpp"
@@ -32,7 +33,6 @@ void require(bool condition, const char* message) {
            lhs.similar_cap_factor == rhs.similar_cap_factor &&
            lhs.model_cap_factor == rhs.model_cap_factor &&
            lhs.couple_channels == rhs.couple_channels &&
-           lhs.aggregation_window == rhs.aggregation_window &&
            lhs.weight_gamma == rhs.weight_gamma;
 }
 
@@ -48,6 +48,53 @@ void require(bool condition, const char* message) {
 
 [[nodiscard]] int patch_position(int patch_size, int x, int y, int t) noexcept {
     return (((t * patch_size) + y) * patch_size) + x;
+}
+
+[[nodiscard]] int checked_patch_area(StageParameters parameters) {
+    return common::checked_mul_int(parameters.patch_size, parameters.patch_size,
+                                   "patch area overflows int");
+}
+
+[[nodiscard]] int checked_patch_dim(StageParameters parameters) {
+    return common::checked_mul_int(checked_patch_area(parameters),
+                                   parameters.patch_time,
+                                   "patch dimension overflows int");
+}
+
+[[nodiscard]] int checked_estimator_dim(StageParameters parameters,
+                                        int channels) {
+    return common::checked_mul_int(checked_patch_dim(parameters),
+                                   parameters.couple_channels ? channels : 1,
+                                   "estimator dimension overflows int");
+}
+
+[[nodiscard]] int checked_temporal_candidate_count(StageParameters parameters) {
+    return common::checked_add_int(
+        common::checked_add_int(parameters.search_bwd, parameters.search_fwd,
+                                "temporal candidate count overflows int"),
+        1, "temporal candidate count overflows int");
+}
+
+[[nodiscard]] int checked_raw_candidate_count(StageParameters parameters) {
+    const int spatial_candidates = common::checked_mul_int(
+        parameters.search_window, parameters.search_window,
+        "spatial candidate count overflows int");
+    return common::checked_mul_int(spatial_candidates,
+                                   checked_temporal_candidate_count(parameters),
+                                   "candidate count overflows int");
+}
+
+[[nodiscard]] std::size_t checked_group_capacity(int channels, int patch_dim,
+                                                 int similar) {
+    const std::size_t capacity = common::checked_mul_size(
+        common::checked_mul_size(static_cast<std::size_t>(channels),
+                                 static_cast<std::size_t>(patch_dim),
+                                 "group channel dimension overflows size_t"),
+        static_cast<std::size_t>(similar), "group capacity overflows size_t");
+    if (capacity > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::length_error("group capacity overflows int");
+    }
+    return capacity;
 }
 
 void copy_float_row(const float* VNLB_RESTRICT source,
@@ -101,6 +148,11 @@ void copy_float_row(const float* VNLB_RESTRICT source,
     const float cap = std::ceil(static_cast<float>(parameters.similar) *
                                 parameters.similar_cap_factor);
     return std::max(parameters.similar, static_cast<int>(cap));
+}
+
+[[nodiscard]] int checked_retained_group_count(StageParameters parameters) {
+    return std::min(soft_similar_cap(parameters),
+                    checked_raw_candidate_count(parameters));
 }
 
 [[nodiscard]] int model_similar_cap(StageParameters parameters) noexcept {
@@ -836,12 +888,25 @@ void compute_temporal_range(VideoGeometry geometry, StageParameters parameters,
                             int anchor_frame, int& low, int& high) {
     const int max_origin_frame =
         geometry.source_frames() - parameters.patch_time;
-    const int shift =
-        std::min(0, anchor_frame - parameters.search_bwd) +
-        std::max(0, anchor_frame + parameters.search_fwd - max_origin_frame);
-    low = std::max(0, anchor_frame - parameters.search_bwd - shift);
-    high = std::min(max_origin_frame,
-                    anchor_frame + parameters.search_fwd - shift);
+    const int search_start =
+        common::checked_add_int(anchor_frame, -parameters.search_bwd,
+                                "temporal search range overflows int");
+    const int search_end =
+        common::checked_add_int(anchor_frame, parameters.search_fwd,
+                                "temporal search range overflows int");
+    const int shift = common::checked_add_int(
+        std::min(0, search_start),
+        std::max(
+            0, common::checked_add_int(search_end, -max_origin_frame,
+                                       "temporal search range overflows int")),
+        "temporal search range overflows int");
+    low = std::max(
+        0, common::checked_add_int(search_start, -shift,
+                                   "temporal search range overflows int"));
+    high = std::min(
+        max_origin_frame,
+        common::checked_add_int(search_end, -shift,
+                                "temporal search range overflows int"));
 }
 
 void schedule_temporal_range(int anchor_frame, int low, int high,
@@ -860,10 +925,23 @@ void compute_spatial_range(VideoGeometry geometry, StageParameters parameters,
                            int center, int axis_size, int& low, int& high) {
     const int max_origin = axis_size - parameters.patch_size;
     const int half = (parameters.search_window - 1) / 2;
-    const int shift =
-        std::min(0, center - half) + std::max(0, center + half - max_origin);
-    low = std::max(0, center - half - shift);
-    high = std::min(max_origin, center + half - shift);
+    const int search_start = common::checked_add_int(
+        center, -half, "spatial search range overflows int");
+    const int search_end = common::checked_add_int(
+        center, half, "spatial search range overflows int");
+    const int shift = common::checked_add_int(
+        std::min(0, search_start),
+        std::max(0,
+                 common::checked_add_int(search_end, -max_origin,
+                                         "spatial search range overflows int")),
+        "spatial search range overflows int");
+    low = std::max(
+        0, common::checked_add_int(search_start, -shift,
+                                   "spatial search range overflows int"));
+    high =
+        std::min(max_origin,
+                 common::checked_add_int(search_end, -shift,
+                                         "spatial search range overflows int"));
     (void)geometry;
 }
 
@@ -889,7 +967,7 @@ void initialize_frame_processing_mask(VideoGeometry geometry,
                                       StageParameters parameters,
                                       int anchor_frame,
                                       std::vector<unsigned char>& mask) {
-    mask.assign(static_cast<std::size_t>(geometry.width * geometry.height), 0);
+    mask.assign(static_cast<std::size_t>(geometry.plane_pixels()), 0);
     const int max_x = geometry.width - parameters.patch_size;
     const int max_y = geometry.height - parameters.patch_size;
     for (int y = 0; y <= max_y; ++y) {
@@ -1202,8 +1280,12 @@ int find_similar_patches(ConstVideoView search_source, int anchor_x,
     workspace.matches_.clear();
     const int output_cap =
         std::min(soft_similar_cap(parameters),
-                 parameters.search_window * parameters.search_window *
-                     static_cast<int>(workspace.scheduled_frames_.size()));
+                 common::checked_mul_int(
+                     common::checked_mul_int(
+                         parameters.search_window, parameters.search_window,
+                         "spatial candidate count overflows int"),
+                     static_cast<int>(workspace.scheduled_frames_.size()),
+                     "candidate count overflows int"));
     workspace.matches_.reserve(static_cast<std::size_t>(output_cap));
 
     std::vector<float>& top_distances = workspace.top_distances_;
@@ -1772,21 +1854,15 @@ void write_sample_contributions_coupled(
 }
 
 template <Stage stage>
-void validate_video_for_stage(ConstVideoView video, StageParameters parameters)
-    VNLB_INTERNAL_VALIDATION_NOEXCEPT {
-#if VNLB_INTERNAL_VALIDATION_ENABLED
+void validate_video_for_stage(ConstVideoView video,
+                              StageParameters parameters) {
     require(video.has_storage(), "video data pointer must not be null");
     validate_stage_configuration(video.geometry(), parameters);
-#else
-    (void)video;
-    (void)parameters;
-#endif
 }
 
-void validate_contribution_layout(
-    aggregate::ContributionStackView stack, VideoGeometry geometry,
-    StageParameters parameters) VNLB_INTERNAL_VALIDATION_NOEXCEPT {
-#if VNLB_INTERNAL_VALIDATION_ENABLED
+void validate_contribution_layout(aggregate::ContributionStackView stack,
+                                  VideoGeometry geometry,
+                                  StageParameters parameters) {
     const auto layout = stack.layout();
     require(stack.has_storage(),
             "contribution stack data pointer must not be null");
@@ -1798,11 +1874,6 @@ void validate_contribution_layout(
                 layout.search_fwd == parameters.search_fwd &&
                 layout.patch_time == parameters.patch_time,
             "contribution stack temporal layout does not match parameters");
-#else
-    (void)stack;
-    (void)geometry;
-    (void)parameters;
-#endif
 }
 
 template <Stage stage, typename FlowProvider, typename ProcessGroupFn>
@@ -1813,12 +1884,10 @@ ProcessStats process_anchor_impl(ConstVideoView noisy, ConstVideoView reference,
                                  StageWorkspace& workspace,
                                  ProcessGroupFn process_group) {
     validate_video_for_stage<stage>(noisy, parameters);
-#if VNLB_INTERNAL_VALIDATION_ENABLED
     if constexpr (stage == Stage::Final) {
         require(noisy.geometry().same_shape(reference.geometry()),
                 "noisy and reference videos must have the same shape");
     }
-#endif
     if constexpr (stage == Stage::Basic) {
         (void)reference;
     }
@@ -1898,7 +1967,8 @@ ProcessStats process_anchor_impl(ConstVideoView noisy, ConstVideoView reference,
 } // namespace
 
 void validate_stage_parameters(StageParameters parameters) {
-    require(parameters.sigma > 0.0F, "sigma must be positive");
+    require(std::isfinite(parameters.sigma) && parameters.sigma > 0.0F,
+            "sigma must be finite and positive");
     require(parameters.patch_size > 0, "block_size must be positive");
     require(parameters.patch_time > 0, "patch_time must be positive");
     require(parameters.search_window > 0 && parameters.search_window % 2 == 1,
@@ -1915,12 +1985,17 @@ void validate_stage_parameters(StageParameters parameters) {
                 (parameters.model_cap_factor == 0.0F ||
                  parameters.model_cap_factor >= 1.0F),
             "model_cap_factor must be zero or at least 1.0");
-    require(parameters.beta > 0.0F, "beta must be positive");
-    require(parameters.tau >= 0.0F, "tau must be non-negative");
+    require(std::isfinite(parameters.beta) && parameters.beta > 0.0F,
+            "beta must be finite and positive");
+    require(std::isfinite(parameters.tau) && parameters.tau >= 0.0F,
+            "tau must be finite and non-negative");
     require(std::isfinite(parameters.variance_threshold),
             "variance_threshold must be finite");
-    require(parameters.sigma_basic >= 0.0F, "sigma_basic must be non-negative");
-    require(parameters.gamma > 0.0F, "gamma must be positive");
+    require(std::isfinite(parameters.sigma_basic) &&
+                parameters.sigma_basic >= 0.0F,
+            "sigma_basic must be finite and non-negative");
+    require(std::isfinite(parameters.gamma) && parameters.gamma > 0.0F,
+            "gamma must be finite and positive");
     require(std::isfinite(parameters.weight_alpha) &&
                 parameters.weight_alpha >= 0.0F,
             "weight_alpha must be finite and non-negative");
@@ -1936,28 +2011,31 @@ void validate_stage_parameters(StageParameters parameters) {
     require(std::isfinite(parameters.membership_noise_floor) &&
                 parameters.membership_noise_floor > 0.0F,
             "membership_noise_floor must be finite and positive");
-    require(normalized_proc_step(parameters) > 0,
-            "block_step must be positive");
-    require(!parameters.order_invariance,
-            "order-invariant filtering is not implemented yet");
+    require(parameters.proc_step >= 0,
+            "block_step must be non-negative; use 0 for auto");
 }
 
 void validate_stage_configuration(VideoGeometry geometry,
                                   StageParameters parameters) {
     validate_stage_parameters(parameters);
     require(geometry.valid(), "video geometry must be non-empty");
+    (void)geometry.checked_sample_count();
     require(geometry.first_frame >= 0, "first frame must be non-negative");
-    require(geometry.source_frames() >= geometry.frames + geometry.first_frame,
+    const int local_frame_end =
+        common::checked_add_int(geometry.frames, geometry.first_frame,
+                                "local frame window overflows int");
+    require(geometry.source_frames() >= local_frame_end,
             "local frame window must fit inside the source frame count");
     require(parameters.patch_size <= geometry.width &&
                 parameters.patch_size <= geometry.height,
             "block_size must fit inside the frame");
     require(parameters.patch_time <= geometry.source_frames(),
             "patch_time must fit inside the clip");
-    const int patch_dim =
-        parameters.patch_size * parameters.patch_size * parameters.patch_time;
     const int estimator_dim =
-        patch_dim * (parameters.couple_channels ? geometry.channels : 1);
+        checked_estimator_dim(parameters, geometry.channels);
+    const int max_similar = checked_retained_group_count(parameters);
+    (void)checked_group_capacity(geometry.channels,
+                                 checked_patch_dim(parameters), max_similar);
     require(parameters.rank <= estimator_dim,
             "rank must not exceed the effective patch dimension");
     require(
@@ -1979,9 +2057,7 @@ FrameRange input_frame_range_for_anchor(VideoGeometry geometry,
 template <Stage stage>
 void StageWorkspace::prepare(VideoGeometry geometry,
                              StageParameters parameters) {
-#if VNLB_INTERNAL_VALIDATION_ENABLED
-    validate_stage_parameters(parameters);
-#endif
+    validate_stage_configuration(geometry, parameters);
 
     constexpr Stage current_stage = stage;
     const bool geometry_changed = !geometry.same_shape(geometry_);
@@ -1995,16 +2071,12 @@ void StageWorkspace::prepare(VideoGeometry geometry,
         return;
     }
 
-    patch_area_ = parameters.patch_size * parameters.patch_size;
-    patch_dim_ = patch_area_ * parameters.patch_time;
-    estimator_dim_ =
-        patch_dim_ * (parameters.couple_channels ? geometry.channels : 1);
-    max_similar_ =
-        std::max(parameters.similar,
-                 parameters.search_window * parameters.search_window *
-                     (parameters.search_bwd + parameters.search_fwd + 1));
+    patch_area_ = checked_patch_area(parameters);
+    patch_dim_ = checked_patch_dim(parameters);
+    estimator_dim_ = checked_estimator_dim(parameters, geometry.channels);
+    max_similar_ = checked_retained_group_count(parameters);
     const std::size_t group_capacity =
-        static_cast<std::size_t>(geometry.channels * patch_dim_ * max_similar_);
+        checked_group_capacity(geometry.channels, patch_dim_, max_similar_);
     group_noisy_.resize(group_capacity);
     group_basic_.resize(group_capacity);
     mean_noisy_.resize(static_cast<std::size_t>(estimator_dim_));

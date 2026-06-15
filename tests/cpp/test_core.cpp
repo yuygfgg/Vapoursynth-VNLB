@@ -5,7 +5,9 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -50,6 +52,16 @@ void test_mvtools_flow_provider_clamps_center() {
         std::span<const vnlb::flow::MVToolsVectorGrid>(previous), 1, {}, 0);
     const auto center = provider.center_for({3, 3, 2, 0, 2, 5, 5});
     require(center.x == 4 && center.y == 0, "mvtools center clamp mismatch");
+
+    const std::vector<const vnlb::flow::MVToolsVectorGrid*> previous_ptrs{
+        &previous[0], &previous[1]};
+    const vnlb::flow::MVToolsFlowProvider pointer_provider(
+        std::span<const vnlb::flow::MVToolsVectorGrid* const>(previous_ptrs), 1,
+        {}, 0);
+    const auto pointer_center =
+        pointer_provider.center_for({3, 3, 2, 0, 2, 5, 5});
+    require(pointer_center.x == 4 && pointer_center.y == 0,
+            "mvtools pointer center clamp mismatch");
 }
 
 void test_aggregate_frame() {
@@ -107,6 +119,34 @@ void test_stage_parameter_defaults() {
                   "default membership noise floor");
 }
 
+template <typename Fn> void require_throws(Fn&& fn, std::string_view label) {
+    try {
+        fn();
+    } catch (const std::exception&) {
+        return;
+    }
+    std::cerr << label << '\n';
+    std::exit(EXIT_FAILURE);
+}
+
+void test_checked_geometry_rejects_overflow() {
+    require_throws(
+        [] {
+            const vnlb::core::VideoGeometry geometry{
+                std::numeric_limits<int>::max(), 2, 1, 1};
+            vnlb::core::VideoBuffer buffer(geometry);
+        },
+        "overflowing video geometry must be rejected");
+
+    require_throws(
+        [] {
+            const vnlb::core::VideoGeometry geometry{2, 2, 1, 1};
+            (void)vnlb::aggregate::make_contribution_layout(
+                geometry, std::numeric_limits<int>::max(), 0, 1);
+        },
+        "overflowing contribution layout must be rejected");
+}
+
 vnlb::core::StageParameters constant_test_parameters() {
     vnlb::core::StageParameters parameters{};
     parameters.sigma = 0.1F;
@@ -121,6 +161,72 @@ vnlb::core::StageParameters constant_test_parameters() {
     parameters.tau = 1000.0F;
     parameters.proc_step = 2;
     return parameters;
+}
+
+void test_stage_parameter_validation_rejects_invalid_medium_inputs() {
+    const auto valid = constant_test_parameters();
+    vnlb::core::validate_stage_parameters(valid);
+
+    const auto require_invalid = [&](auto mutate, std::string_view label) {
+        auto parameters = valid;
+        mutate(parameters);
+        require_throws(
+            [&] { vnlb::core::validate_stage_parameters(parameters); }, label);
+    };
+
+    require_invalid(
+        [](vnlb::core::StageParameters& parameters) {
+            parameters.sigma = std::numeric_limits<float>::infinity();
+        },
+        "infinite sigma must be rejected");
+    require_invalid(
+        [](vnlb::core::StageParameters& parameters) {
+            parameters.beta = std::numeric_limits<float>::infinity();
+        },
+        "infinite beta must be rejected");
+    require_invalid(
+        [](vnlb::core::StageParameters& parameters) {
+            parameters.tau = std::numeric_limits<float>::infinity();
+        },
+        "infinite tau must be rejected");
+    require_invalid(
+        [](vnlb::core::StageParameters& parameters) {
+            parameters.sigma_basic = std::numeric_limits<float>::infinity();
+        },
+        "infinite sigma_basic must be rejected");
+    require_invalid(
+        [](vnlb::core::StageParameters& parameters) {
+            parameters.gamma = std::numeric_limits<float>::infinity();
+        },
+        "infinite gamma must be rejected");
+    require_invalid(
+        [](vnlb::core::StageParameters& parameters) {
+            parameters.proc_step = -1;
+        },
+        "negative block_step must be rejected");
+
+    auto auto_step = valid;
+    auto_step.proc_step = 0;
+    vnlb::core::validate_stage_parameters(auto_step);
+}
+
+void test_workspace_uses_retained_group_capacity() {
+    auto parameters = constant_test_parameters();
+    parameters.search_window = 21;
+    parameters.search_bwd = 5;
+    parameters.search_fwd = 5;
+    parameters.similar = 4;
+    parameters.similar_cap_factor = 2.0F;
+    parameters.rank = 4;
+
+    const vnlb::core::VideoGeometry geometry{16, 16, 4, 1};
+    vnlb::core::StageWorkspace workspace;
+    workspace.prepare<vnlb::core::Stage::Basic>(geometry, parameters);
+
+    require(workspace.max_similar_ == 8,
+            "workspace max_similar must use retained group cap");
+    require(workspace.group_noisy_.size() == 32,
+            "workspace group capacity must use retained group cap");
 }
 
 template <typename ProcessAnchor>
@@ -272,6 +378,9 @@ int main() {
     test_mvtools_flow_provider_clamps_center();
     test_aggregate_frame();
     test_stage_parameter_defaults();
+    test_checked_geometry_rejects_overflow();
+    test_stage_parameter_validation_rejects_invalid_medium_inputs();
+    test_workspace_uses_retained_group_capacity();
     test_basic_constant_pipeline();
     test_final_constant_pipeline();
     test_basic_weighted_gradient_pipeline();

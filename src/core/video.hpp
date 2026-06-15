@@ -1,5 +1,7 @@
 #pragma once
 
+#include "common/arithmetic.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <limits>
@@ -26,12 +28,17 @@ struct VideoGeometry {
         return width > 0 && height > 0 && frames > 0 && channels > 0;
     }
 
-    [[nodiscard]] int plane_pixels() const noexcept { return width * height; }
-    [[nodiscard]] int frame_samples() const noexcept {
-        return plane_pixels() * channels;
+    [[nodiscard]] int plane_pixels() const {
+        return common::checked_mul_int(width, height,
+                                       "video plane pixel count overflows int");
     }
-    [[nodiscard]] int sample_count() const noexcept {
-        return frame_samples() * frames;
+    [[nodiscard]] int frame_samples() const {
+        return common::checked_mul_int(
+            plane_pixels(), channels, "video frame sample count overflows int");
+    }
+    [[nodiscard]] int sample_count() const {
+        return common::checked_mul_int(frame_samples(), frames,
+                                       "video sample count overflows int");
     }
     [[nodiscard]] int source_frames() const noexcept {
         return total_frames > 0 ? total_frames : frames;
@@ -49,17 +56,7 @@ struct VideoGeometry {
             throw std::invalid_argument("video geometry must be non-empty");
         }
 
-        const auto checked_mul = [](std::size_t a, std::size_t b) {
-            if (a != 0 && b > std::numeric_limits<std::size_t>::max() / a) {
-                throw std::length_error("video geometry overflows size_t");
-            }
-            return a * b;
-        };
-
-        return checked_mul(checked_mul(static_cast<std::size_t>(width),
-                                       static_cast<std::size_t>(height)),
-                           checked_mul(static_cast<std::size_t>(frames),
-                                       static_cast<std::size_t>(channels)));
+        return static_cast<std::size_t>(sample_count());
     }
 
     [[nodiscard]] int local_frame(int frame) const noexcept {
@@ -68,10 +65,12 @@ struct VideoGeometry {
 
     [[nodiscard]] std::size_t index_local(int x, int y, int frame,
                                           int channel) const noexcept {
-        return static_cast<std::size_t>(frame) *
-                   static_cast<std::size_t>(frame_samples()) +
-               static_cast<std::size_t>(channel) *
-                   static_cast<std::size_t>(plane_pixels()) +
+        const std::size_t plane =
+            static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+        const std::size_t frame_stride =
+            plane * static_cast<std::size_t>(channels);
+        return static_cast<std::size_t>(frame) * frame_stride +
+               static_cast<std::size_t>(channel) * plane +
                static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
                static_cast<std::size_t>(x);
     }
@@ -111,7 +110,8 @@ class ConstVideoView {
             const int local_frame = geometry_.local_frame(frame);
             const ConstPlaneView plane =
                 planes_[local_frame * geometry_.channels + channel];
-            return plane.data[y * plane.stride + x];
+            return plane
+                .data[(static_cast<std::ptrdiff_t>(y) * plane.stride) + x];
         }
         return data_[geometry_.index(x, y, frame, channel)];
     }

@@ -328,6 +328,14 @@ class MVToolsFlowProvider {
         : previous_(previous), next_(next),
           previous_first_frame_(previous_first_frame),
           next_first_frame_(next_first_frame) {}
+    constexpr MVToolsFlowProvider(
+        std::span<const MVToolsVectorGrid* const> previous,
+        int previous_first_frame,
+        std::span<const MVToolsVectorGrid* const> next,
+        int next_first_frame) noexcept
+        : previous_ptrs_(previous), next_ptrs_(next),
+          previous_first_frame_(previous_first_frame),
+          next_first_frame_(next_first_frame) {}
 
     [[nodiscard]] SearchCenter
     center_for(SearchCenterRequest request) const noexcept {
@@ -384,6 +392,12 @@ class MVToolsFlowProvider {
     [[nodiscard]] const MVToolsVectorGrid*
     previous_grid(int frame) const noexcept {
         const int local = frame - previous_first_frame_;
+        if (!previous_ptrs_.empty()) {
+            if (local < 0 || local >= static_cast<int>(previous_ptrs_.size())) {
+                return nullptr;
+            }
+            return previous_ptrs_[static_cast<std::size_t>(local)];
+        }
         if (local < 0 || local >= static_cast<int>(previous_.size())) {
             return nullptr;
         }
@@ -392,6 +406,12 @@ class MVToolsFlowProvider {
 
     [[nodiscard]] const MVToolsVectorGrid* next_grid(int frame) const noexcept {
         const int local = frame - next_first_frame_;
+        if (!next_ptrs_.empty()) {
+            if (local < 0 || local >= static_cast<int>(next_ptrs_.size())) {
+                return nullptr;
+            }
+            return next_ptrs_[static_cast<std::size_t>(local)];
+        }
         if (local < 0 || local >= static_cast<int>(next_.size())) {
             return nullptr;
         }
@@ -400,6 +420,8 @@ class MVToolsFlowProvider {
 
     std::span<const MVToolsVectorGrid> previous_{};
     std::span<const MVToolsVectorGrid> next_{};
+    std::span<const MVToolsVectorGrid* const> previous_ptrs_{};
+    std::span<const MVToolsVectorGrid* const> next_ptrs_{};
     int previous_first_frame_ = 0;
     int next_first_frame_ = 0;
 };

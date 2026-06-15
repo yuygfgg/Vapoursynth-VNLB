@@ -1,4 +1,5 @@
 #include "aggregate/aggregate.hpp"
+#include "common/arithmetic.hpp"
 #include "common/compiler.hpp"
 #include "core/core.hpp"
 #include "flow/flow.hpp"
@@ -14,11 +15,13 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -39,6 +42,11 @@ constexpr float kEightBitSampleScale = 255.0F;
 constexpr float kEightBitDistanceScale =
     kEightBitSampleScale * kEightBitSampleScale;
 
+struct CachedMVToolsGrid {
+    int frame = -1;
+    vnlb::flow::MVToolsVectorGrid grid;
+};
+
 struct VNLBThreadData {
     StageWorkspace workspace;
     std::vector<const VSFrame*> clip_frames;
@@ -48,8 +56,10 @@ struct VNLBThreadData {
     std::vector<ConstPlaneView> clip_planes;
     std::vector<ConstPlaneView> ref_planes;
     std::vector<ContributionPlaneView> contribution_planes;
-    std::vector<vnlb::flow::MVToolsVectorGrid> mvfw_grids;
-    std::vector<vnlb::flow::MVToolsVectorGrid> mvbw_grids;
+    std::vector<CachedMVToolsGrid> mvfw_cache;
+    std::vector<CachedMVToolsGrid> mvbw_cache;
+    std::vector<const vnlb::flow::MVToolsVectorGrid*> mvfw_grids;
+    std::vector<const vnlb::flow::MVToolsVectorGrid*> mvbw_grids;
 };
 
 struct VNLBData {
@@ -87,12 +97,56 @@ struct FrameListGuard {
     std::vector<const VSFrame*>& frames;
     const VSAPI* vsapi = nullptr;
 
+    FrameListGuard(std::vector<const VSFrame*>& owned_frames,
+                   const VSAPI* api) noexcept
+        : frames(owned_frames), vsapi(api) {}
+    FrameListGuard(const FrameListGuard&) = delete;
+    FrameListGuard& operator=(const FrameListGuard&) = delete;
+    FrameListGuard(FrameListGuard&&) = delete;
+    FrameListGuard& operator=(FrameListGuard&&) = delete;
+
     ~FrameListGuard() {
         for (const VSFrame* frame : frames) {
-            vsapi->freeFrame(frame);
+            if (frame != nullptr) {
+                vsapi->freeFrame(frame);
+            }
         }
         frames.clear();
     }
+};
+
+class FrameGuard {
+  public:
+    FrameGuard(const VSFrame* frame, const VSAPI* vsapi) noexcept
+        : frame_(frame), vsapi_(vsapi) {}
+    FrameGuard(const FrameGuard&) = delete;
+    FrameGuard& operator=(const FrameGuard&) = delete;
+    FrameGuard(FrameGuard&&) = delete;
+    FrameGuard& operator=(FrameGuard&&) = delete;
+
+    ~FrameGuard() {
+        if (frame_ != nullptr) {
+            vsapi_->freeFrame(frame_);
+        }
+    }
+
+    [[nodiscard]] const VSFrame* get() const noexcept { return frame_; }
+
+    [[nodiscard]] const VSFrame* release() noexcept {
+        const VSFrame* frame = frame_;
+        frame_ = nullptr;
+        return frame;
+    }
+
+  private:
+    const VSFrame* frame_ = nullptr;
+    const VSAPI* vsapi_ = nullptr;
+};
+
+struct TemporalParameters {
+    int patch_time = 1;
+    int search_bwd = 1;
+    int search_fwd = 1;
 };
 
 [[nodiscard]] bool is_supported_float_format(const VSVideoInfo* info) noexcept {
@@ -126,6 +180,31 @@ struct FrameListGuard {
     return static_cast<int>(stride / static_cast<ptrdiff_t>(sizeof(float)));
 }
 
+[[nodiscard]] const VSFrame* get_frame_filter_checked(int frame, VSNode* node,
+                                                      VSFrameContext* frame_ctx,
+                                                      const VSAPI* vsapi,
+                                                      const char* label) {
+    const VSFrame* result = vsapi->getFrameFilter(frame, node, frame_ctx);
+    if (result == nullptr) {
+        throw std::runtime_error(std::string("failed to fetch ") + label +
+                                 " frame");
+    }
+    return result;
+}
+
+[[nodiscard]] VSFrame* new_video_frame_checked(const VSVideoFormat* format,
+                                               int width, int height,
+                                               const VSFrame* prop_src,
+                                               VSCore* core,
+                                               const VSAPI* vsapi) {
+    VSFrame* frame =
+        vsapi->newVideoFrame(format, width, height, prop_src, core);
+    if (frame == nullptr) {
+        throw std::bad_alloc();
+    }
+    return frame;
+}
+
 [[nodiscard]] VideoGeometry make_geometry(const VSVideoInfo& info,
                                           int first_frame = 0,
                                           int local_frames = 0) {
@@ -144,6 +223,51 @@ struct FrameListGuard {
 [[nodiscard]] bool map_has_key(const VSMap* in, const VSAPI* vsapi,
                                const char* key) noexcept {
     return vsapi->mapNumElements(in, key) > 0;
+}
+
+[[nodiscard]] TemporalParameters
+parse_temporal_parameters(const VSMap* in, const VSAPI* vsapi,
+                          TemporalParameters fallback) {
+    TemporalParameters result = fallback;
+    result.patch_time =
+        map_get_optional_int(in, vsapi, "patch_time", result.patch_time);
+
+    const int radius = map_get_optional_int(in, vsapi, "radius", -1);
+    if (radius >= 0) {
+        result.search_bwd = radius;
+        result.search_fwd = radius;
+    } else if (map_has_key(in, vsapi, "radius")) {
+        throw std::invalid_argument("radius must be non-negative");
+    }
+
+    result.search_bwd =
+        map_get_optional_int(in, vsapi, "search_bwd", result.search_bwd);
+    result.search_fwd =
+        map_get_optional_int(in, vsapi, "search_fwd", result.search_fwd);
+    if (result.patch_time <= 0 || result.search_bwd < 0 ||
+        result.search_fwd < 0) {
+        throw std::invalid_argument(
+            "patch_time must be positive and search_bwd/search_fwd must be "
+            "non-negative");
+    }
+    return result;
+}
+
+[[nodiscard]] int checked_slot_count(int search_bwd, int search_fwd,
+                                     int patch_time) {
+    return vnlb::common::checked_add_int(
+        vnlb::common::checked_add_int(search_bwd, search_fwd,
+                                      "slot count overflows int"),
+        patch_time, "slot count overflows int");
+}
+
+[[nodiscard]] int checked_contribution_height(int source_height,
+                                              int slot_count) {
+    return vnlb::common::checked_mul_int(
+        source_height,
+        vnlb::common::checked_mul_int(2, slot_count,
+                                      "contribution height overflows int"),
+        "contribution height overflows int");
 }
 
 [[nodiscard]] float map_get_optional_float(const VSMap* in, const VSAPI* vsapi,
@@ -216,8 +340,13 @@ template <Stage stage>
 
     parameters.patch_size =
         map_get_optional_int(in, vsapi, "block_size", parameters.patch_size);
-    parameters.patch_time =
-        map_get_optional_int(in, vsapi, "patch_time", parameters.patch_time);
+    const TemporalParameters temporal = parse_temporal_parameters(
+        in, vsapi,
+        TemporalParameters{parameters.patch_time, parameters.search_bwd,
+                           parameters.search_fwd});
+    parameters.patch_time = temporal.patch_time;
+    parameters.search_bwd = temporal.search_bwd;
+    parameters.search_fwd = temporal.search_fwd;
     if (map_has_key(in, vsapi, "bm_range")) {
         const int bm_range = map_get_optional_int(in, vsapi, "bm_range", 0);
         if (bm_range < 0 ||
@@ -264,24 +393,12 @@ template <Stage stage>
         map_get_optional_int(in, vsapi, "chroma",
                              parameters.couple_channels ? 1 : 0) != 0;
 
-    const int radius = map_get_optional_int(in, vsapi, "radius", -1);
-    if (radius >= 0) {
-        parameters.search_bwd = radius;
-        parameters.search_fwd = radius;
-    } else if (map_has_key(in, vsapi, "radius")) {
-        throw std::invalid_argument("radius must be non-negative");
-    }
-    parameters.search_bwd =
-        map_get_optional_int(in, vsapi, "search_bwd", parameters.search_bwd);
-    parameters.search_fwd =
-        map_get_optional_int(in, vsapi, "search_fwd", parameters.search_fwd);
-
     return parameters;
 }
 
-[[nodiscard]] int slot_count(const StageParameters& parameters) noexcept {
-    return parameters.search_bwd + parameters.search_fwd +
-           parameters.patch_time;
+[[nodiscard]] int slot_count(const StageParameters& parameters) {
+    return checked_slot_count(parameters.search_bwd, parameters.search_fwd,
+                              parameters.patch_time);
 }
 
 [[nodiscard]] std::span<const std::byte>
@@ -327,16 +444,9 @@ read_mvtools_analysis_from_node(VSNode* node, const char* argument_name,
                                     argument_name +
                                     " analysis frame: " + error_message);
     }
+    FrameGuard frame_guard{frame, vsapi};
 
-    try {
-        const vnlb::flow::MVToolsAnalysisData analysis =
-            read_mvtools_analysis_from_frame(frame, vsapi);
-        vsapi->freeFrame(frame);
-        return analysis;
-    } catch (...) {
-        vsapi->freeFrame(frame);
-        throw;
-    }
+    return read_mvtools_analysis_from_frame(frame_guard.get(), vsapi);
 }
 
 void validate_mvtools_clip(const VSVideoInfo& source_vi,
@@ -374,25 +484,82 @@ void validate_mvtools_clip(const VSVideoInfo& source_vi,
            map_get_optional_bool_prop(props, vsapi, "Scenechange");
 }
 
-void parse_mvtools_grids(const std::vector<const VSFrame*>& vector_frames,
-                         const std::vector<const VSFrame*>& source_frames,
-                         vnlb::flow::MVToolsAnalysisData analysis,
-                         std::vector<vnlb::flow::MVToolsVectorGrid>& grids,
-                         const VSAPI* vsapi) {
+void prune_mvtools_cache(std::vector<CachedMVToolsGrid>& cache, int first_frame,
+                         int last_frame) {
+    cache.erase(std::remove_if(cache.begin(), cache.end(),
+                               [&](const CachedMVToolsGrid& entry) noexcept {
+                                   return entry.frame < first_frame ||
+                                          entry.frame > last_frame;
+                               }),
+                cache.end());
+}
+
+[[nodiscard]] const vnlb::flow::MVToolsVectorGrid*
+find_cached_mvtools_grid(std::vector<CachedMVToolsGrid>& cache, int frame) {
+    auto existing =
+        std::find_if(cache.begin(), cache.end(),
+                     [frame](const CachedMVToolsGrid& entry) noexcept {
+                         return entry.frame == frame;
+                     });
+    return existing == cache.end() ? nullptr : &existing->grid;
+}
+
+void cache_mvtools_grid(const VSFrame* vector_frame,
+                        const VSFrame* source_frame, int frame,
+                        vnlb::flow::MVToolsAnalysisData analysis,
+                        std::vector<CachedMVToolsGrid>& cache,
+                        const VSAPI* vsapi) {
+    if (find_cached_mvtools_grid(cache, frame) != nullptr) {
+        return;
+    }
+
+    vnlb::flow::MVToolsVectorGrid grid;
+    const VSMap* props = vsapi->getFramePropertiesRO(vector_frame);
+    vnlb::flow::parse_mvtools_vectors(
+        map_get_binary_prop(props, vsapi, "MVTools_vectors"), analysis, grid);
+    if (has_scene_change(source_frame, vsapi, analysis.backwards)) {
+        grid.valid = false;
+    }
+
+    cache.push_back(CachedMVToolsGrid{frame, std::move(grid)});
+}
+
+void build_mvtools_grid_window(
+    const std::vector<const VSFrame*>& vector_frames,
+    const std::vector<const VSFrame*>& source_frames, int first_frame,
+    vnlb::flow::MVToolsAnalysisData analysis,
+    std::vector<CachedMVToolsGrid>& cache,
+    std::vector<const vnlb::flow::MVToolsVectorGrid*>& grids,
+    const VSAPI* vsapi) {
     if (vector_frames.size() != source_frames.size()) {
         throw std::invalid_argument(
             "MVTools vector frame window does not match source frame window");
     }
 
+    if (vector_frames.empty()) {
+        grids.clear();
+        return;
+    }
+
+    const int last_frame = vnlb::common::checked_add_int(
+        first_frame, static_cast<int>(vector_frames.size() - 1),
+        "MVTools vector frame window overflows int");
+    prune_mvtools_cache(cache, first_frame, last_frame);
+    cache.reserve(cache.size() + vector_frames.size());
+    for (std::size_t index = 0; index < vector_frames.size(); ++index) {
+        const int current_frame = vnlb::common::checked_add_int(
+            first_frame, static_cast<int>(index),
+            "MVTools vector frame window overflows int");
+        cache_mvtools_grid(vector_frames[index], source_frames[index],
+                           current_frame, analysis, cache, vsapi);
+    }
+
     grids.resize(vector_frames.size());
     for (std::size_t index = 0; index < vector_frames.size(); ++index) {
-        const VSMap* props = vsapi->getFramePropertiesRO(vector_frames[index]);
-        vnlb::flow::parse_mvtools_vectors(
-            map_get_binary_prop(props, vsapi, "MVTools_vectors"), analysis,
-            grids[index]);
-        if (has_scene_change(source_frames[index], vsapi, analysis.backwards)) {
-            grids[index].valid = false;
-        }
+        const int current_frame = vnlb::common::checked_add_int(
+            first_frame, static_cast<int>(index),
+            "MVTools vector frame window overflows int");
+        grids[index] = find_cached_mvtools_grid(cache, current_frame);
     }
 }
 
@@ -456,8 +623,9 @@ render_stage_frame(int frame, VNLBData* data, VSFrameContext* frame_ctx,
         geometry, data->parameters.search_bwd, data->parameters.search_fwd,
         data->parameters.patch_time);
     VSFrame* out =
-        vsapi->newVideoFrame(&data->out_vi.format, data->out_vi.width,
-                             data->out_vi.height, nullptr, core);
+        new_video_frame_checked(&data->out_vi.format, data->out_vi.width,
+                                data->out_vi.height, nullptr, core, vsapi);
+    FrameGuard out_guard{out, vsapi};
     thread_data.contribution_planes.clear();
     thread_data.contribution_planes.reserve(
         static_cast<std::size_t>(layout.channels));
@@ -487,37 +655,39 @@ render_stage_frame(int frame, VNLBData* data, VSFrameContext* frame_ctx,
         thread_data.ref_frames.reserve(static_cast<std::size_t>(local_frames));
         thread_data.mvfw_frames.reserve(static_cast<std::size_t>(local_frames));
         thread_data.mvbw_frames.reserve(static_cast<std::size_t>(local_frames));
-        thread_data.clip_planes.reserve(
-            static_cast<std::size_t>(local_frames * channels));
-        thread_data.ref_planes.reserve(
-            static_cast<std::size_t>(local_frames * channels));
+        const std::size_t local_plane_count = vnlb::common::checked_mul_size(
+            static_cast<std::size_t>(local_frames),
+            static_cast<std::size_t>(channels),
+            "local frame plane count overflows size_t");
+        thread_data.clip_planes.reserve(local_plane_count);
+        thread_data.ref_planes.reserve(local_plane_count);
 
         FrameListGuard clip_guard{thread_data.clip_frames, vsapi};
         FrameListGuard ref_guard{thread_data.ref_frames, vsapi};
         FrameListGuard mvfw_guard{thread_data.mvfw_frames, vsapi};
         FrameListGuard mvbw_guard{thread_data.mvbw_frames, vsapi};
         for (int needed = range.first; needed <= range.last; ++needed) {
-            const VSFrame* clip_frame =
-                vsapi->getFrameFilter(needed, data->node, frame_ctx);
+            const VSFrame* clip_frame = get_frame_filter_checked(
+                needed, data->node, frame_ctx, vsapi, "clip");
             thread_data.clip_frames.push_back(clip_frame);
             append_frame_planes(clip_frame, channels, thread_data.clip_planes,
                                 vsapi);
 
             if constexpr (stage == Stage::Final) {
-                const VSFrame* ref_frame =
-                    vsapi->getFrameFilter(needed, data->ref_node, frame_ctx);
+                const VSFrame* ref_frame = get_frame_filter_checked(
+                    needed, data->ref_node, frame_ctx, vsapi, "ref");
                 thread_data.ref_frames.push_back(ref_frame);
                 append_frame_planes(ref_frame, channels, thread_data.ref_planes,
                                     vsapi);
             }
 
             if constexpr (has_mvfw) {
-                thread_data.mvfw_frames.push_back(
-                    vsapi->getFrameFilter(needed, data->mvfw_node, frame_ctx));
+                thread_data.mvfw_frames.push_back(get_frame_filter_checked(
+                    needed, data->mvfw_node, frame_ctx, vsapi, "mvfw"));
             }
             if constexpr (has_mvbw) {
-                thread_data.mvbw_frames.push_back(
-                    vsapi->getFrameFilter(needed, data->mvbw_node, frame_ctx));
+                thread_data.mvbw_frames.push_back(get_frame_filter_checked(
+                    needed, data->mvbw_node, frame_ctx, vsapi, "mvbw"));
             }
         }
 
@@ -529,26 +699,30 @@ render_stage_frame(int frame, VNLBData* data, VSFrameContext* frame_ctx,
 
         if constexpr (has_mvfw || has_mvbw) {
             if constexpr (has_mvfw) {
-                parse_mvtools_grids(
+                build_mvtools_grid_window(
                     thread_data.mvfw_frames, thread_data.clip_frames,
-                    data->mvfw_analysis, thread_data.mvfw_grids, vsapi);
+                    range.first, data->mvfw_analysis, thread_data.mvfw_cache,
+                    thread_data.mvfw_grids, vsapi);
             } else {
                 thread_data.mvfw_grids.clear();
             }
             if constexpr (has_mvbw) {
-                parse_mvtools_grids(
+                build_mvtools_grid_window(
                     thread_data.mvbw_frames, thread_data.clip_frames,
-                    data->mvbw_analysis, thread_data.mvbw_grids, vsapi);
+                    range.first, data->mvbw_analysis, thread_data.mvbw_cache,
+                    thread_data.mvbw_grids, vsapi);
             } else {
                 thread_data.mvbw_grids.clear();
             }
 
             const vnlb::flow::MVToolsFlowProvider flow_provider(
-                std::span<const vnlb::flow::MVToolsVectorGrid>(
-                    thread_data.mvfw_grids),
+                std::span<const vnlb::flow::MVToolsVectorGrid* const>(
+                    thread_data.mvfw_grids.data(),
+                    thread_data.mvfw_grids.size()),
                 range.first,
-                std::span<const vnlb::flow::MVToolsVectorGrid>(
-                    thread_data.mvbw_grids),
+                std::span<const vnlb::flow::MVToolsVectorGrid* const>(
+                    thread_data.mvbw_grids.data(),
+                    thread_data.mvbw_grids.size()),
                 range.first);
             if constexpr (stage == Stage::Basic) {
                 vnlb::core::process_basic_anchor_mvtools(
@@ -580,7 +754,7 @@ render_stage_frame(int frame, VNLBData* data, VSFrameContext* frame_ctx,
     } else {
         vnlb::aggregate::clear_contributions(contributions);
     }
-    return out;
+    return out_guard.release();
 }
 
 template <Stage stage, bool has_mvfw, bool has_mvbw>
@@ -729,7 +903,8 @@ void VNLBCreate(const VSMap* in, VSMap* out, VSCore* core, const VSAPI* vsapi) {
         data->slot_count = slot_count(data->parameters);
         data->vi = *vi;
         data->out_vi = *vi;
-        data->out_vi.height *= 2 * data->slot_count;
+        data->out_vi.height =
+            checked_contribution_height(data->out_vi.height, data->slot_count);
 
         VSCoreInfo core_info;
         vsapi->getCoreInfo(core, &core_info);
@@ -762,13 +937,19 @@ void VNLBCreate(const VSMap* in, VSMap* out, VSCore* core, const VSAPI* vsapi) {
 }
 
 [[nodiscard]] int aggregate_first_anchor(const VAggregateData* data,
-                                         int frame) noexcept {
-    return std::max(0, frame - (data->search_fwd + data->patch_time - 1));
+                                         int frame) {
+    const int forward_span =
+        vnlb::common::checked_add_int(data->search_fwd, data->patch_time - 1,
+                                      "aggregate temporal span overflows int");
+    const int first = vnlb::common::checked_add_int(
+        frame, -forward_span, "aggregate anchor frame overflows int");
+    return std::max(0, first);
 }
 
-[[nodiscard]] int aggregate_last_anchor(const VAggregateData* data,
-                                        int frame) noexcept {
-    return std::min(data->src_vi.numFrames - 1, frame + data->search_bwd);
+[[nodiscard]] int aggregate_last_anchor(const VAggregateData* data, int frame) {
+    const int last = vnlb::common::checked_add_int(
+        frame, data->search_bwd, "aggregate anchor frame overflows int");
+    return std::min(data->src_vi.numFrames - 1, last);
 }
 
 void request_aggregate_frames(const VAggregateData* data, int frame,
@@ -787,10 +968,12 @@ void request_aggregate_frames(const VAggregateData* data, int frame,
                                                     VSCore* core,
                                                     const VSAPI* vsapi) {
     const VSFrame* src_frame =
-        vsapi->getFrameFilter(frame, data->src_node, frameCtx);
+        get_frame_filter_checked(frame, data->src_node, frameCtx, vsapi, "src");
+    FrameGuard src_guard{src_frame, vsapi};
     VSFrame* dst_frame =
-        vsapi->newVideoFrame(&data->out_vi.format, data->out_vi.width,
-                             data->out_vi.height, src_frame, core);
+        new_video_frame_checked(&data->out_vi.format, data->out_vi.width,
+                                data->out_vi.height, src_frame, core, vsapi);
+    FrameGuard dst_guard{dst_frame, vsapi};
 
     const int first_anchor = aggregate_first_anchor(data, frame);
     const int last_anchor = aggregate_last_anchor(data, frame);
@@ -798,7 +981,8 @@ void request_aggregate_frames(const VAggregateData* data, int frame,
     frames.reserve(static_cast<std::size_t>(last_anchor - first_anchor + 1));
     FrameListGuard frame_guard{frames, vsapi};
     for (int anchor = first_anchor; anchor <= last_anchor; ++anchor) {
-        frames.push_back(vsapi->getFrameFilter(anchor, data->node, frameCtx));
+        frames.push_back(get_frame_filter_checked(anchor, data->node, frameCtx,
+                                                  vsapi, "contribution"));
     }
 
     const int channels = plane_count(data->src_vi);
@@ -814,11 +998,15 @@ void request_aggregate_frames(const VAggregateData* data, int frame,
 
         std::vector<const float*> contribution_ptrs(frames.size());
         std::vector<int> contribution_strides(frames.size());
-        std::vector<int> numerator_base_rows(frames.size());
+        std::vector<std::ptrdiff_t> numerator_base_rows(frames.size());
         for (std::size_t index = 0; index < frames.size(); ++index) {
             const int anchor = first_anchor + static_cast<int>(index);
-            const int slot = frame - anchor + data->search_bwd;
-            numerator_base_rows[index] = slot * 2 * height;
+            const int slot = vnlb::common::checked_add_int(
+                vnlb::common::checked_add_int(
+                    frame, -anchor, "aggregate slot index overflows int"),
+                data->search_bwd, "aggregate slot index overflows int");
+            numerator_base_rows[index] =
+                static_cast<std::ptrdiff_t>(slot) * 2 * height;
             const float* VNLB_RESTRICT contribution =
                 reinterpret_cast<const float*>(
                     vsapi->getReadPtr(frames[index], plane));
@@ -828,13 +1016,15 @@ void request_aggregate_frames(const VAggregateData* data, int frame,
         }
 
         for (int y = 0; y < height; ++y) {
-            const float* VNLB_RESTRICT src_row = src + (y * src_stride);
-            float* VNLB_RESTRICT dst_row = dst + (y * dst_stride);
+            const float* VNLB_RESTRICT src_row =
+                src + (static_cast<std::ptrdiff_t>(y) * src_stride);
+            float* VNLB_RESTRICT dst_row =
+                dst + (static_cast<std::ptrdiff_t>(y) * dst_stride);
             for (int x = 0; x < width; ++x) {
                 float numerator = 0.0F;
                 float weight = 0.0F;
                 for (std::size_t index = 0; index < frames.size(); ++index) {
-                    const int base_row = numerator_base_rows[index];
+                    const std::ptrdiff_t base_row = numerator_base_rows[index];
                     const float* VNLB_RESTRICT contribution_ptr =
                         contribution_ptrs[index];
                     const int contribution_stride = contribution_strides[index];
@@ -850,8 +1040,7 @@ void request_aggregate_frames(const VAggregateData* data, int frame,
         }
     }
 
-    vsapi->freeFrame(src_frame);
-    return dst_frame;
+    return dst_guard.release();
 }
 
 const VSFrame* VS_CC VAggregateGetFrame(int n, int activationReason,
@@ -909,29 +1098,18 @@ void VS_CC VAggregateCreate(const VSMap* in, VSMap* out,
                 "Aggregate requires matching constant GrayS or YUV444PS clips");
         }
 
-        data->patch_time = map_get_optional_int(in, vsapi, "patch_time", 1);
-        data->search_bwd =
-            map_get_optional_int(in, vsapi, "search_bwd", data->search_bwd);
-        data->search_fwd =
-            map_get_optional_int(in, vsapi, "search_fwd", data->search_fwd);
-        const int radius = map_get_optional_int(in, vsapi, "radius", -1);
-        if (radius >= 0) {
-            data->search_bwd = radius;
-            data->search_fwd = radius;
-        } else if (map_has_key(in, vsapi, "radius")) {
-            throw std::invalid_argument("radius must be non-negative");
-        }
-        if (data->patch_time <= 0 || data->search_bwd < 0 ||
-            data->search_fwd < 0) {
-            throw std::invalid_argument(
-                "patch_time must be positive and search_bwd/search_fwd must be "
-                "non-negative");
-        }
-
-        data->slot_count =
-            data->search_bwd + data->search_fwd + data->patch_time;
+        const TemporalParameters temporal = parse_temporal_parameters(
+            in, vsapi,
+            TemporalParameters{data->patch_time, data->search_bwd,
+                               data->search_fwd});
+        data->patch_time = temporal.patch_time;
+        data->search_bwd = temporal.search_bwd;
+        data->search_fwd = temporal.search_fwd;
+        data->slot_count = checked_slot_count(
+            data->search_bwd, data->search_fwd, data->patch_time);
         if (vi->width != src_vi->width ||
-            vi->height != src_vi->height * 2 * data->slot_count ||
+            vi->height !=
+                checked_contribution_height(src_vi->height, data->slot_count) ||
             vi->numFrames != src_vi->numFrames) {
             throw std::invalid_argument(
                 "contribution stack layout does not match src and parameters");
