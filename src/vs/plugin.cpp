@@ -804,9 +804,9 @@ void VS_CC VNLBFree(void* instanceData, [[maybe_unused]] VSCore* core,
 template <Stage stage>
 [[nodiscard]] constexpr const char* vnlb_filter_name() noexcept {
     if constexpr (stage == Stage::Basic) {
-        return "VNLB Basic";
+        return "Basic";
     }
-    return "VNLB Final";
+    return "Final";
 }
 
 template <Stage stage, bool has_mvfw, bool has_mvbw>
@@ -1123,7 +1123,7 @@ void VS_CC VAggregateCreate(const VSMap* in, VSMap* out,
             {data->node, rpGeneral},
             {data->src_node, rpStrictSpatial},
         }};
-        vsapi->createVideoFilter(out, "VAggregate", &data->out_vi,
+        vsapi->createVideoFilter(out, "Aggregate", &data->out_vi,
                                  VAggregateGetFrame, VAggregateFree, fmParallel,
                                  deps.data(), static_cast<int>(deps.size()),
                                  data.release(), core);
