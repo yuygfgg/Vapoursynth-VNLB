@@ -418,72 +418,54 @@ first_matrix_rows(const linalg::Matrix<float>& matrix, int rows) noexcept {
                                           matrix.cols(), matrix.cols());
 }
 
-void copy_group_channel_to_samples(const std::vector<float>& group, int channel,
-                                   int patch_dim, int similar,
-                                   linalg::Matrix<float>& samples) {
-    samples.resize(static_cast<std::size_t>(similar),
-                   static_cast<std::size_t>(patch_dim));
-    const int channel_base = channel * patch_dim * similar;
-    for (int patch = 0; patch < similar; ++patch) {
-        float* VNLB_RESTRICT row =
-            samples.row_data(static_cast<std::size_t>(patch));
-        for (int position = 0; position < patch_dim; ++position) {
-            row[position] = group[static_cast<std::size_t>(
-                channel_base + (position * similar) + patch)];
-        }
-    }
-}
+enum class GroupSampleCopyDirection {
+    GroupToSamples,
+    SamplesToGroup,
+};
 
-void copy_samples_to_group_channel(const linalg::Matrix<float>& samples,
-                                   int channel, int patch_dim, int similar,
-                                   std::vector<float>& group) {
-    const int channel_base = channel * patch_dim * similar;
-    for (int patch = 0; patch < similar; ++patch) {
-        const float* VNLB_RESTRICT row =
-            samples.row_data(static_cast<std::size_t>(patch));
-        for (int position = 0; position < patch_dim; ++position) {
-            group[static_cast<std::size_t>(channel_base + (position * similar) +
-                                           patch)] = row[position];
-        }
+template <GroupSampleCopyDirection direction, typename Group, typename Samples>
+void copy_group_samples(Group& group, int first_channel, int channel_count,
+                        int patch_dim, int similar, Samples& samples) {
+    if constexpr (direction == GroupSampleCopyDirection::GroupToSamples) {
+        samples.resize(static_cast<std::size_t>(similar),
+                       static_cast<std::size_t>(channel_count * patch_dim));
     }
-}
 
-void copy_group_coupled_to_samples(const std::vector<float>& group,
-                                   int channels, int patch_dim, int similar,
-                                   linalg::Matrix<float>& samples) {
-    const int sample_dim = channels * patch_dim;
-    samples.resize(static_cast<std::size_t>(similar),
-                   static_cast<std::size_t>(sample_dim));
     for (int patch = 0; patch < similar; ++patch) {
-        float* VNLB_RESTRICT row =
+        auto* VNLB_RESTRICT row =
             samples.row_data(static_cast<std::size_t>(patch));
-        for (int channel = 0; channel < channels; ++channel) {
-            const int channel_base = channel * patch_dim * similar;
-            const int output_base = channel * patch_dim;
+        for (int channel_offset = 0; channel_offset < channel_count;
+             ++channel_offset) {
+            const int group_channel = first_channel + channel_offset;
+            const int group_base = group_channel * patch_dim * similar;
+            const int sample_base = channel_offset * patch_dim;
             for (int position = 0; position < patch_dim; ++position) {
-                row[output_base + position] = group[static_cast<std::size_t>(
-                    channel_base + (position * similar) + patch)];
+                const std::size_t group_index = static_cast<std::size_t>(
+                    group_base + (position * similar) + patch);
+                const int sample_index = sample_base + position;
+                if constexpr (direction ==
+                              GroupSampleCopyDirection::GroupToSamples) {
+                    row[sample_index] = group[group_index];
+                } else {
+                    group[group_index] = row[sample_index];
+                }
             }
         }
     }
 }
 
-void copy_samples_to_group_coupled(const linalg::Matrix<float>& samples,
-                                   int channels, int patch_dim, int similar,
-                                   std::vector<float>& group) {
-    for (int patch = 0; patch < similar; ++patch) {
-        const float* VNLB_RESTRICT row =
-            samples.row_data(static_cast<std::size_t>(patch));
-        for (int channel = 0; channel < channels; ++channel) {
-            const int channel_base = channel * patch_dim * similar;
-            const int input_base = channel * patch_dim;
-            for (int position = 0; position < patch_dim; ++position) {
-                group[static_cast<std::size_t>(channel_base +
-                                               (position * similar) + patch)] =
-                    row[input_base + position];
-            }
-        }
-    }
+void copy_group_to_samples(const std::vector<float>& group, int first_channel,
+                           int channel_count, int patch_dim, int similar,
+                           linalg::Matrix<float>& samples) {
+    copy_group_samples<GroupSampleCopyDirection::GroupToSamples>(
+        group, first_channel, channel_count, patch_dim, similar, samples);
+}
+
+void copy_samples_to_group(const linalg::Matrix<float>& samples,
+                           int first_channel, int channel_count, int patch_dim,
+                           int similar, std::vector<float>& group) {
+    copy_group_samples<GroupSampleCopyDirection::SamplesToGroup>(
+        group, first_channel, channel_count, patch_dim, similar, samples);
 }
 
 void copy_samples(linalg::ConstMatrixView<float> input,
@@ -813,17 +795,16 @@ template <Stage stage>
 void transform_vnlb_channel(StageWorkspace& workspace, int channel, int similar,
                             bool flat_patch) {
     const int patch_dim = workspace.patch_dim_;
-    copy_group_channel_to_samples(workspace.group_noisy_, channel, patch_dim,
-                                  similar, workspace.samples_noisy_);
+    copy_group_to_samples(workspace.group_noisy_, channel, 1, patch_dim,
+                          similar, workspace.samples_noisy_);
     if constexpr (stage == Stage::Final) {
-        copy_group_channel_to_samples(workspace.group_basic_, channel,
-                                      patch_dim, similar,
-                                      workspace.samples_basic_);
+        copy_group_to_samples(workspace.group_basic_, channel, 1, patch_dim,
+                              similar, workspace.samples_basic_);
     }
 
     filter_vnlb_samples<stage>(workspace, similar, patch_dim, flat_patch);
-    copy_samples_to_group_channel(workspace.filtered_, channel, patch_dim,
-                                  similar, workspace.group_noisy_);
+    copy_samples_to_group(workspace.filtered_, channel, 1, patch_dim, similar,
+                          workspace.group_noisy_);
 }
 
 template <Stage stage>
@@ -832,17 +813,16 @@ void transform_vnlb_coupled(StageWorkspace& workspace, int similar,
     const int channels = workspace.geometry_.channels;
     const int patch_dim = workspace.patch_dim_;
     const int sample_dim = channels * patch_dim;
-    copy_group_coupled_to_samples(workspace.group_noisy_, channels, patch_dim,
-                                  similar, workspace.samples_noisy_);
+    copy_group_to_samples(workspace.group_noisy_, 0, channels, patch_dim,
+                          similar, workspace.samples_noisy_);
     if constexpr (stage == Stage::Final) {
-        copy_group_coupled_to_samples(workspace.group_basic_, channels,
-                                      patch_dim, similar,
-                                      workspace.samples_basic_);
+        copy_group_to_samples(workspace.group_basic_, 0, channels, patch_dim,
+                              similar, workspace.samples_basic_);
     }
 
     filter_vnlb_samples<stage>(workspace, similar, sample_dim, flat_patch);
-    copy_samples_to_group_coupled(workspace.filtered_, channels, patch_dim,
-                                  similar, workspace.group_noisy_);
+    copy_samples_to_group(workspace.filtered_, 0, channels, patch_dim, similar,
+                          workspace.group_noisy_);
 }
 
 template <Stage stage>
@@ -1412,11 +1392,44 @@ void gather_basic_group(ConstVideoView noisy, StageWorkspace& workspace,
     }
 }
 
-void gather_basic_samples_coupled_planes(
-    VideoGeometry geometry, const ConstPlaneView* VNLB_RESTRICT planes,
-    StageWorkspace& workspace, int similar) {
+[[nodiscard]] const float*
+plane_array_row(VideoGeometry geometry,
+                const ConstPlaneView* VNLB_RESTRICT planes, int frame,
+                int channel, int x, int y) noexcept {
+    const int local_frame = geometry.local_frame(frame);
+    const ConstPlaneView plane =
+        planes[(local_frame * geometry.channels) + channel];
+    return plane.data + (static_cast<std::ptrdiff_t>(y) * plane.stride) + x;
+}
+
+template <typename CopyRowFn>
+void visit_matched_sample_rows(StageParameters parameters,
+                               const PatchMatch& match, int channels,
+                               int patch_dim, CopyRowFn copy_row) {
+    const int patch_size = parameters.patch_size;
+    for (int channel = 0; channel < channels; ++channel) {
+        const int channel_base = channel * patch_dim;
+        for (int frame_delta = 0; frame_delta < parameters.patch_time;
+             ++frame_delta) {
+            const int frame = match.frame + frame_delta;
+            for (int y = 0; y < patch_size; ++y) {
+                const int position =
+                    patch_position(patch_size, 0, y, frame_delta);
+                copy_row(frame, channel, match.x, match.y + y,
+                         channel_base + position);
+            }
+        }
+    }
+}
+
+template <typename SourceRowFn>
+void gather_basic_samples_coupled_from_rows(VideoGeometry geometry,
+                                            StageWorkspace& workspace,
+                                            int similar,
+                                            SourceRowFn source_row) {
+    const StageParameters parameters = workspace.parameters_;
     const int channels = geometry.channels;
-    const int patch_size = workspace.parameters_.patch_size;
+    const int patch_size = parameters.patch_size;
     const int patch_dim = workspace.patch_dim_;
     const int sample_dim = channels * patch_dim;
     workspace.samples_noisy_.resize(static_cast<std::size_t>(similar),
@@ -1427,29 +1440,24 @@ void gather_basic_samples_coupled_planes(
             workspace.matches_[static_cast<std::size_t>(patch)];
         float* VNLB_RESTRICT row =
             workspace.samples_noisy_.row_data(static_cast<std::size_t>(patch));
-        for (int channel = 0; channel < channels; ++channel) {
-            const int channel_base = channel * patch_dim;
-            for (int frame_delta = 0;
-                 frame_delta < workspace.parameters_.patch_time;
-                 ++frame_delta) {
-                const int local_frame =
-                    geometry.local_frame(match.frame + frame_delta);
-                const ConstPlaneView plane =
-                    planes[(local_frame * channels) + channel];
-                for (int y = 0; y < patch_size; ++y) {
-                    const int position =
-                        patch_position(patch_size, 0, y, frame_delta);
-                    const float* VNLB_RESTRICT input_row =
-                        plane.data +
-                        (static_cast<std::ptrdiff_t>(match.y + y) *
-                         plane.stride) +
-                        match.x;
-                    copy_float_row(input_row, row + channel_base + position,
-                                   patch_size);
-                }
-            }
-        }
+        visit_matched_sample_rows(
+            parameters, match, channels, patch_dim,
+            [&](int frame, int channel, int x, int y, int sample_position) {
+                const float* VNLB_RESTRICT input_row =
+                    source_row(frame, channel, x, y);
+                copy_float_row(input_row, row + sample_position, patch_size);
+            });
     }
+}
+
+void gather_basic_samples_coupled_planes(
+    VideoGeometry geometry, const ConstPlaneView* VNLB_RESTRICT planes,
+    StageWorkspace& workspace, int similar) {
+    gather_basic_samples_coupled_from_rows(
+        geometry, workspace, similar,
+        [geometry, planes](int frame, int channel, int x, int y) {
+            return plane_array_row(geometry, planes, frame, channel, x, y);
+        });
 }
 
 void gather_basic_samples_coupled(ConstVideoView noisy,
@@ -1460,41 +1468,11 @@ void gather_basic_samples_coupled(ConstVideoView noisy,
         return;
     }
 
-    const VideoGeometry geometry = noisy.geometry();
-    const int channels = geometry.channels;
-    const int patch_size = workspace.parameters_.patch_size;
-    const int patch_dim = workspace.patch_dim_;
-    const int sample_dim = channels * patch_dim;
-    workspace.samples_noisy_.resize(static_cast<std::size_t>(similar),
-                                    static_cast<std::size_t>(sample_dim));
-
-    for (int patch = 0; patch < similar; ++patch) {
-        const PatchMatch match =
-            workspace.matches_[static_cast<std::size_t>(patch)];
-        float* VNLB_RESTRICT row =
-            workspace.samples_noisy_.row_data(static_cast<std::size_t>(patch));
-        for (int channel = 0; channel < channels; ++channel) {
-            const int channel_base = channel * patch_dim;
-            for (int frame_delta = 0;
-                 frame_delta < workspace.parameters_.patch_time;
-                 ++frame_delta) {
-                const int frame = match.frame + frame_delta;
-                const float* VNLB_RESTRICT plane =
-                    noisy.plane_data(frame, channel);
-                const int stride = noisy.plane_stride(frame, channel);
-                for (int y = 0; y < patch_size; ++y) {
-                    const int position =
-                        patch_position(patch_size, 0, y, frame_delta);
-                    const float* VNLB_RESTRICT input_row =
-                        plane +
-                        (static_cast<std::ptrdiff_t>(match.y + y) * stride) +
-                        match.x;
-                    copy_float_row(input_row, row + channel_base + position,
-                                   patch_size);
-                }
-            }
-        }
-    }
+    gather_basic_samples_coupled_from_rows(
+        noisy.geometry(), workspace, similar,
+        [noisy](int frame, int channel, int x, int y) {
+            return noisy.row_data(frame, channel, y, x);
+        });
 }
 
 void gather_final_group(ConstVideoView noisy, ConstVideoView basic,
@@ -1529,12 +1507,15 @@ void gather_final_group(ConstVideoView noisy, ConstVideoView basic,
     }
 }
 
-void gather_final_samples_coupled_planes(
-    VideoGeometry geometry, const ConstPlaneView* VNLB_RESTRICT noisy_planes,
-    const ConstPlaneView* VNLB_RESTRICT basic_planes, StageWorkspace& workspace,
-    int similar) {
+template <typename NoisyRowFn, typename BasicRowFn>
+void gather_final_samples_coupled_from_rows(VideoGeometry geometry,
+                                            StageWorkspace& workspace,
+                                            int similar,
+                                            NoisyRowFn noisy_source_row,
+                                            BasicRowFn basic_source_row) {
+    const StageParameters parameters = workspace.parameters_;
     const int channels = geometry.channels;
-    const int patch_size = workspace.parameters_.patch_size;
+    const int patch_size = parameters.patch_size;
     const int patch_dim = workspace.patch_dim_;
     const int sample_dim = channels * patch_dim;
     workspace.samples_noisy_.resize(static_cast<std::size_t>(similar),
@@ -1549,38 +1530,35 @@ void gather_final_samples_coupled_planes(
             workspace.samples_noisy_.row_data(static_cast<std::size_t>(patch));
         float* VNLB_RESTRICT basic_row =
             workspace.samples_basic_.row_data(static_cast<std::size_t>(patch));
-        for (int channel = 0; channel < channels; ++channel) {
-            const int channel_base = channel * patch_dim;
-            for (int frame_delta = 0;
-                 frame_delta < workspace.parameters_.patch_time;
-                 ++frame_delta) {
-                const int local_frame =
-                    geometry.local_frame(match.frame + frame_delta);
-                const int plane_index = (local_frame * channels) + channel;
-                const ConstPlaneView noisy_plane = noisy_planes[plane_index];
-                const ConstPlaneView basic_plane = basic_planes[plane_index];
-                for (int y = 0; y < patch_size; ++y) {
-                    const int position =
-                        patch_position(patch_size, 0, y, frame_delta);
-                    const int sample_position = channel_base + position;
-                    const float* VNLB_RESTRICT noisy_input_row =
-                        noisy_plane.data +
-                        (static_cast<std::ptrdiff_t>(match.y + y) *
-                         noisy_plane.stride) +
-                        match.x;
-                    const float* VNLB_RESTRICT basic_input_row =
-                        basic_plane.data +
-                        (static_cast<std::ptrdiff_t>(match.y + y) *
-                         basic_plane.stride) +
-                        match.x;
-                    copy_float_row(noisy_input_row, noisy_row + sample_position,
-                                   patch_size);
-                    copy_float_row(basic_input_row, basic_row + sample_position,
-                                   patch_size);
-                }
-            }
-        }
+        visit_matched_sample_rows(
+            parameters, match, channels, patch_dim,
+            [&](int frame, int channel, int x, int y, int sample_position) {
+                const float* VNLB_RESTRICT noisy_input_row =
+                    noisy_source_row(frame, channel, x, y);
+                const float* VNLB_RESTRICT basic_input_row =
+                    basic_source_row(frame, channel, x, y);
+                copy_float_row(noisy_input_row, noisy_row + sample_position,
+                               patch_size);
+                copy_float_row(basic_input_row, basic_row + sample_position,
+                               patch_size);
+            });
     }
+}
+
+void gather_final_samples_coupled_planes(
+    VideoGeometry geometry, const ConstPlaneView* VNLB_RESTRICT noisy_planes,
+    const ConstPlaneView* VNLB_RESTRICT basic_planes, StageWorkspace& workspace,
+    int similar) {
+    gather_final_samples_coupled_from_rows(
+        geometry, workspace, similar,
+        [geometry, noisy_planes](int frame, int channel, int x, int y) {
+            return plane_array_row(geometry, noisy_planes, frame, channel, x,
+                                   y);
+        },
+        [geometry, basic_planes](int frame, int channel, int x, int y) {
+            return plane_array_row(geometry, basic_planes, frame, channel, x,
+                                   y);
+        });
 }
 
 void gather_final_samples_coupled(ConstVideoView noisy, ConstVideoView basic,
@@ -1596,57 +1574,14 @@ void gather_final_samples_coupled(ConstVideoView noisy, ConstVideoView basic,
         }
     }
 
-    const VideoGeometry geometry = noisy.geometry();
-    const int channels = geometry.channels;
-    const int patch_size = workspace.parameters_.patch_size;
-    const int patch_dim = workspace.patch_dim_;
-    const int sample_dim = channels * patch_dim;
-    workspace.samples_noisy_.resize(static_cast<std::size_t>(similar),
-                                    static_cast<std::size_t>(sample_dim));
-    workspace.samples_basic_.resize(static_cast<std::size_t>(similar),
-                                    static_cast<std::size_t>(sample_dim));
-
-    for (int patch = 0; patch < similar; ++patch) {
-        const PatchMatch match =
-            workspace.matches_[static_cast<std::size_t>(patch)];
-        float* VNLB_RESTRICT noisy_row =
-            workspace.samples_noisy_.row_data(static_cast<std::size_t>(patch));
-        float* VNLB_RESTRICT basic_row =
-            workspace.samples_basic_.row_data(static_cast<std::size_t>(patch));
-        for (int channel = 0; channel < channels; ++channel) {
-            const int channel_base = channel * patch_dim;
-            for (int frame_delta = 0;
-                 frame_delta < workspace.parameters_.patch_time;
-                 ++frame_delta) {
-                const int frame = match.frame + frame_delta;
-                const float* VNLB_RESTRICT noisy_plane =
-                    noisy.plane_data(frame, channel);
-                const int noisy_stride = noisy.plane_stride(frame, channel);
-                const float* VNLB_RESTRICT basic_plane =
-                    basic.plane_data(frame, channel);
-                const int basic_stride = basic.plane_stride(frame, channel);
-                for (int y = 0; y < patch_size; ++y) {
-                    const int position =
-                        patch_position(patch_size, 0, y, frame_delta);
-                    const int sample_position = channel_base + position;
-                    const float* VNLB_RESTRICT noisy_input_row =
-                        noisy_plane +
-                        (static_cast<std::ptrdiff_t>(match.y + y) *
-                         noisy_stride) +
-                        match.x;
-                    const float* VNLB_RESTRICT basic_input_row =
-                        basic_plane +
-                        (static_cast<std::ptrdiff_t>(match.y + y) *
-                         basic_stride) +
-                        match.x;
-                    copy_float_row(noisy_input_row, noisy_row + sample_position,
-                                   patch_size);
-                    copy_float_row(basic_input_row, basic_row + sample_position,
-                                   patch_size);
-                }
-            }
-        }
-    }
+    gather_final_samples_coupled_from_rows(
+        noisy.geometry(), workspace, similar,
+        [noisy](int frame, int channel, int x, int y) {
+            return noisy.row_data(frame, channel, y, x);
+        },
+        [basic](int frame, int channel, int x, int y) {
+            return basic.row_data(frame, channel, y, x);
+        });
 }
 
 void write_group_contributions(StageWorkspace& workspace, int anchor_frame,
@@ -1970,6 +1905,44 @@ ProcessStats process_anchor_impl(ConstVideoView noisy, ConstVideoView reference,
     return stats;
 }
 
+template <typename FlowProvider>
+ProcessStats process_basic_anchor(
+    ConstVideoView noisy, int anchor_frame, StageParameters parameters,
+    const FlowProvider& flow_provider,
+    aggregate::ContributionStackView contributions, StageWorkspace& workspace) {
+    return process_anchor_impl<Stage::Basic>(
+        noisy, ConstVideoView{}, anchor_frame, parameters, flow_provider,
+        contributions, workspace, [&](int similar) {
+            if (parameters.couple_channels && noisy.geometry().channels > 1) {
+                gather_basic_samples_coupled(noisy, workspace, similar);
+                transform_vnlb_coupled_samples<Stage::Basic>(workspace,
+                                                             similar);
+            } else {
+                gather_basic_group(noisy, workspace, similar);
+                transform_vnlb_group<Stage::Basic>(workspace, similar);
+            }
+        });
+}
+
+template <typename FlowProvider>
+ProcessStats process_final_anchor(
+    ConstVideoView noisy, ConstVideoView basic, int anchor_frame,
+    StageParameters parameters, const FlowProvider& flow_provider,
+    aggregate::ContributionStackView contributions, StageWorkspace& workspace) {
+    return process_anchor_impl<Stage::Final>(
+        noisy, basic, anchor_frame, parameters, flow_provider, contributions,
+        workspace, [&](int similar) {
+            if (parameters.couple_channels && noisy.geometry().channels > 1) {
+                gather_final_samples_coupled(noisy, basic, workspace, similar);
+                transform_vnlb_coupled_samples<Stage::Final>(workspace,
+                                                             similar);
+            } else {
+                gather_final_group(noisy, basic, workspace, similar);
+                transform_vnlb_group<Stage::Final>(workspace, similar);
+            }
+        });
+}
+
 } // namespace
 
 void validate_stage_parameters(StageParameters parameters) {
@@ -2107,72 +2080,32 @@ ProcessStats process_basic_anchor_no_flow(
     ConstVideoView noisy, int anchor_frame, StageParameters parameters,
     const flow::SameLocationProvider& flow_provider,
     aggregate::ContributionStackView contributions, StageWorkspace& workspace) {
-    return process_anchor_impl<Stage::Basic>(
-        noisy, ConstVideoView{}, anchor_frame, parameters, flow_provider,
-        contributions, workspace, [&](int similar) {
-            if (parameters.couple_channels && noisy.geometry().channels > 1) {
-                gather_basic_samples_coupled(noisy, workspace, similar);
-                transform_vnlb_coupled_samples<Stage::Basic>(workspace,
-                                                             similar);
-            } else {
-                gather_basic_group(noisy, workspace, similar);
-                transform_vnlb_group<Stage::Basic>(workspace, similar);
-            }
-        });
+    return process_basic_anchor(noisy, anchor_frame, parameters, flow_provider,
+                                contributions, workspace);
 }
 
 ProcessStats process_final_anchor_no_flow(
     ConstVideoView noisy, ConstVideoView basic, int anchor_frame,
     StageParameters parameters, const flow::SameLocationProvider& flow_provider,
     aggregate::ContributionStackView contributions, StageWorkspace& workspace) {
-    return process_anchor_impl<Stage::Final>(
-        noisy, basic, anchor_frame, parameters, flow_provider, contributions,
-        workspace, [&](int similar) {
-            if (parameters.couple_channels && noisy.geometry().channels > 1) {
-                gather_final_samples_coupled(noisy, basic, workspace, similar);
-                transform_vnlb_coupled_samples<Stage::Final>(workspace,
-                                                             similar);
-            } else {
-                gather_final_group(noisy, basic, workspace, similar);
-                transform_vnlb_group<Stage::Final>(workspace, similar);
-            }
-        });
+    return process_final_anchor(noisy, basic, anchor_frame, parameters,
+                                flow_provider, contributions, workspace);
 }
 
 ProcessStats process_basic_anchor_mvtools(
     ConstVideoView noisy, int anchor_frame, StageParameters parameters,
     const flow::MVToolsFlowProvider& flow_provider,
     aggregate::ContributionStackView contributions, StageWorkspace& workspace) {
-    return process_anchor_impl<Stage::Basic>(
-        noisy, ConstVideoView{}, anchor_frame, parameters, flow_provider,
-        contributions, workspace, [&](int similar) {
-            if (parameters.couple_channels && noisy.geometry().channels > 1) {
-                gather_basic_samples_coupled(noisy, workspace, similar);
-                transform_vnlb_coupled_samples<Stage::Basic>(workspace,
-                                                             similar);
-            } else {
-                gather_basic_group(noisy, workspace, similar);
-                transform_vnlb_group<Stage::Basic>(workspace, similar);
-            }
-        });
+    return process_basic_anchor(noisy, anchor_frame, parameters, flow_provider,
+                                contributions, workspace);
 }
 
 ProcessStats process_final_anchor_mvtools(
     ConstVideoView noisy, ConstVideoView basic, int anchor_frame,
     StageParameters parameters, const flow::MVToolsFlowProvider& flow_provider,
     aggregate::ContributionStackView contributions, StageWorkspace& workspace) {
-    return process_anchor_impl<Stage::Final>(
-        noisy, basic, anchor_frame, parameters, flow_provider, contributions,
-        workspace, [&](int similar) {
-            if (parameters.couple_channels && noisy.geometry().channels > 1) {
-                gather_final_samples_coupled(noisy, basic, workspace, similar);
-                transform_vnlb_coupled_samples<Stage::Final>(workspace,
-                                                             similar);
-            } else {
-                gather_final_group(noisy, basic, workspace, similar);
-                transform_vnlb_group<Stage::Final>(workspace, similar);
-            }
-        });
+    return process_final_anchor(noisy, basic, anchor_frame, parameters,
+                                flow_provider, contributions, workspace);
 }
 
 } // namespace vnlb::core
