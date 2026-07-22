@@ -21,6 +21,32 @@ Note: It is recommended to convert your source into OPP colorspace before callin
 pip install -U vapoursynth-vnlb
 ```
 
+## Experimental CUDA plugin
+
+CUDA Toolkit with `nvcc`, cuSOLVER and cuBLAS is required for building the CUDA plugin.
+
+```sh
+cmake -S . -B build/cuda -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DVNLB_ENABLE_CUDA=ON \
+  -DVNLB_BUILD_PLUGIN=ON \
+  -DVNLB_ENABLE_TESTS=ON \
+  -DVNLB_CUDA_ARCHITECTURES=120-real
+cmake --build build/cuda --target vnlbcu
+ctest --test-dir build/cuda --output-on-failure
+```
+
+Load the resulting module as a separate VapourSynth plugin:
+
+```python
+core.std.LoadPlugin(path="/absolute/path/to/libvnlbcu.so")
+
+basic = core.vnlbcu.Basic(src, sigma=8.0)
+final = core.vnlbcu.Final(src, ref=basic, sigma=8.0)
+```
+
+`vnlbcu.Basic` and `vnlbcu.Final` return normal video frames directly. Do not pass their output to `vnlb.Aggregate`.
+
 ## Usage
 
 ### VNLB Functions
@@ -55,7 +81,7 @@ vnlb.Basic(clip clip, float sigma[, int block_size=8, int block_step=8, int grou
     Soft cap for the patches used to estimate the Bayesian model mean and covariance. The model uses at most `ceil(group_size * model_cap_factor)` retained patches. The default `1.0` keeps model construction fast while still allowing extra threshold-expanded patches to be filtered and aggregated. Use `0.0` to build the model from all retained patches. Non-zero values must be at least `1.0`.
 
 - bm_range:
-    Length of the side of the search neighborhood for block-matching around the guided center. The size of the search window is `(bm_range * 2 + 1) x (bm_range * 2 + 1)`. `3` means candidates are searched inside a `7x7` window. Larger is slower, with more chances to find similar patches.
+    Spatial search radius for block-matching around the guided center. The size of the search window is `(bm_range * 2 + 1) x (bm_range * 2 + 1)`. `3` means candidates are searched inside a `7x7` window. Larger is slower, with more chances to find similar patches.
 
 - patch_time:
     Number of consecutive frames in each temporal patch. A value of `2` estimates patches spanning the anchor frame and the next frame.
@@ -203,6 +229,49 @@ vnlb.Aggregate(clip clip, clip src[, int patch_time=1, int radius=1, int search_
 
 - patch_time, radius, search_bwd, search_fwd:
     Must receive the same temporal settings used to create its contribution stack in `vnlb.Basic` or `vnlb.Final`.
+
+### CUDA Functions
+
+#### basic estimate of CUDA VNLB
+
+```python
+vnlbcu.Basic(clip clip, float sigma[, int block_size=8, int block_step=0, int group_size=15, float cap_factor=4.0, float model_cap_factor=1.0, int bm_range=9, int patch_time=1, int radius=1, int search_bwd=1, int search_fwd=1, int rank=8, float beta=1.0, float tau=0.0, float variance_threshold=1.1, float weight_alpha=0.75, float weight_beta=0.35, float weight_gamma=1.0, float weight_epsilon=1e-6, float membership_noise_floor=0.25, int chroma=1, int device_id=0, int num_streams, int chunk_size=256])
+```
+
+The denoising parameters have the same meaning as in `vnlb.Basic`, with these CUDA-specific defaults and options:
+
+- `block_step=0` selects `max(1, block_size // 2)`; it is `4` for the default `8x8` patch.
+- `group_size` defaults to `15`.
+- `device_id` selects the CUDA device.
+- `num_streams` defaults to `min(VapourSynth threads, 4)` and accepts `1..32`.
+- `chunk_size` is the maximum number of anchor groups submitted together and defaults to `256`.
+
+#### final estimate of CUDA VNLB
+
+```python
+vnlbcu.Final(clip clip, clip ref, float sigma[, int block_size=8, int block_step=0, int group_size=17, float cap_factor=4.0, float model_cap_factor=1.0, int bm_range=9, int patch_time=1, int radius=1, int search_bwd=1, int search_fwd=1, int rank=8, float beta=1.0, float tau=400.0, float variance_threshold=1.7, float weight_alpha=1.0, float weight_beta=0.5, float weight_gamma=1.0, float weight_epsilon=1e-6, float membership_noise_floor=0.25, int chroma=1, int device_id=0, int num_streams, int chunk_size=256, float sigma_basic=0.0, float gamma=0.95, int flat_areas=1])
+```
+
+`ref`, `sigma_basic`, `gamma` and `flat_areas` have the same meaning as in `vnlb.Final`.
+
+The main default differences are:
+
+| Parameter | CUDA Basic / Final | CPU Basic / Final |
+| --- | --- | --- |
+| `group_size` | `15 / 17` | `8 / 8` |
+| automatic `block_step` | `block_size // 2` | `block_size` |
+| output | normal video frame | contribution stack |
+| `chroma` | `1` only | `0` or `1` |
+| `model_cap_factor` | `1.0` only | configurable |
+| motion vectors | not supported | optional MVTools guidance |
+
+#### Additional restrictions for CUDA VNLB
+
+- Only coupled processing is supported, `chroma=0` is not supported.
+- `model_cap_factor` must be `1.0`.
+- The effective model group `K=min(group_size, candidate count)` must satisfy `K<=128`, `rank<=K`, and `K<D`, where `D=channels * block_size^2 * patch_time`.
+- The fused one-block matcher accepts at most `2048` candidates per anchor.
+- MVTools guidance is not available.
 
 
 ## Examples

@@ -814,9 +814,10 @@ void create_bound_vnlb_filter(VSMap* out, VSCore* core, const VSAPI* vsapi,
                               std::unique_ptr<VNLBData>& data,
                               const std::array<VSFilterDependency, 4>& deps,
                               int dep_count) {
-    vsapi->createVideoFilter(out, vnlb_filter_name<stage>(), &data->out_vi,
+    VNLBData* const instance = data.release();
+    vsapi->createVideoFilter(out, vnlb_filter_name<stage>(), &instance->out_vi,
                              VNLBGetFrame<stage, has_mvfw, has_mvbw>, VNLBFree,
-                             fmParallel, deps.data(), dep_count, data.release(),
+                             fmParallel, deps.data(), dep_count, instance,
                              core);
 }
 
@@ -1123,10 +1124,11 @@ void VS_CC VAggregateCreate(const VSMap* in, VSMap* out,
             {data->node, rpGeneral},
             {data->src_node, rpStrictSpatial},
         }};
-        vsapi->createVideoFilter(out, "Aggregate", &data->out_vi,
+        VAggregateData* const instance = data.release();
+        vsapi->createVideoFilter(out, "Aggregate", &instance->out_vi,
                                  VAggregateGetFrame, VAggregateFree, fmParallel,
                                  deps.data(), static_cast<int>(deps.size()),
-                                 data.release(), core);
+                                 instance, core);
     } catch (const std::exception& error) {
         if (data) {
             VAggregateFree(data.release(), core, vsapi);

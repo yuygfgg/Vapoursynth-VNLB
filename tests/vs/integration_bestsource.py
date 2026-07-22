@@ -9,7 +9,10 @@ from pathlib import Path
 import numpy as np
 import vapoursynth as vs
 
-CASE_TOLERANCE = 1.0e-6
+# The fixture was recorded on macOS/arm64.  Different SIMD implementations
+# can accumulate small deterministic differences; 1e-4 is still below 0.026
+# of one 8-bit code value for normalized float samples.
+CASE_TOLERANCE = 1.0e-4
 
 
 def frame_to_array(frame: vs.VideoFrame) -> np.ndarray:

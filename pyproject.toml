@@ -39,6 +39,9 @@ include = [
   "/packaging",
   "/pyproject.toml",
   "/src",
+  "/tools/benchmark_cuda_block_match.cpp",
+  "/tools/benchmark_cuda_aggregation.cpp",
+  "/tools/benchmark_cuda_group_filter.cpp",
   "/tools/repair_windows_wheel.py",
   "/tools/version.py",
 ]

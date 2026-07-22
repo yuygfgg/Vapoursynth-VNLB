@@ -37,6 +37,55 @@ option(VNLB_ENABLE_LAPACK "Enable a LAPACK-compatible eigensolver backend" ON)
 option(VNLB_ENABLE_ACCELERATE "Enable the Accelerate BLAS/LAPACK backend on Apple platforms" ON)
 option(VNLB_ENABLE_WARNINGS "Enable project warning flags" ON)
 option(VNLB_ENABLE_WARNINGS_AS_ERRORS "Treat project warnings as errors" OFF)
+option(VNLB_ENABLE_CUDA "Build the optional vnlbcu CUDA backend" OFF)
+option(VNLB_BUILD_BENCHMARKS "Build optional benchmark executables" OFF)
+set(VNLB_CUDA_ARCHITECTURES "" CACHE STRING
+  "Optional semicolon-separated CUDA architectures for vnlbcu; use a -real suffix to omit PTX"
+)
+set(VNLB_CUDA_HOST_COMPILER "" CACHE FILEPATH
+  "Optional host C++ compiler executable for nvcc"
+)
+
+if(VNLB_ENABLE_CUDA)
+  if(VNLB_CUDA_HOST_COMPILER)
+    if(DEFINED CMAKE_CUDA_HOST_COMPILER AND
+        NOT "${CMAKE_CUDA_HOST_COMPILER}" STREQUAL "" AND
+        NOT "${CMAKE_CUDA_HOST_COMPILER}" STREQUAL
+            "${VNLB_CUDA_HOST_COMPILER}")
+      message(FATAL_ERROR
+        "VNLB_CUDA_HOST_COMPILER and CMAKE_CUDA_HOST_COMPILER select "
+        "different executables. Set only one, or make them identical."
+      )
+    endif()
+    # CMake requires this to be selected before CUDA language detection.  Keep
+    # the project option as a convenient explicit entry point while still
+    # honoring the standard CMAKE_CUDA_HOST_COMPILER variable.
+    set(CMAKE_CUDA_HOST_COMPILER "${VNLB_CUDA_HOST_COMPILER}"
+      CACHE FILEPATH "Host C++ compiler used by nvcc" FORCE
+    )
+  endif()
+
+  include(CheckLanguage)
+  check_language(CUDA)
+  if(NOT CMAKE_CUDA_COMPILER)
+    message(FATAL_ERROR
+      "VNLB_ENABLE_CUDA=ON requires a complete CUDA Toolkit with nvcc. "
+      "If nvcc rejected the default host toolchain, configure a fresh build "
+      "directory with VNLB_CUDA_HOST_COMPILER set to a compiler supported by "
+      "that CUDA Toolkit."
+    )
+  endif()
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  find_package(Threads REQUIRED)
+  if(NOT VNLB_CUDA_ARCHITECTURES)
+    message(WARNING
+      "VNLB_CUDA_ARCHITECTURES is empty; CMake will use the compiler default, "
+      "which may embed PTX or omit the installed GPU. For a deployment build, "
+      "select the real architecture explicitly (for example 120-real)."
+    )
+  endif()
+endif()
 
 set(_VNLB_RELEASE_OPTIMIZATIONS_DEFAULT OFF)
 string(TOUPPER "${CMAKE_BUILD_TYPE}" _VNLB_BUILD_TYPE_UPPER)
@@ -392,6 +441,100 @@ set_target_properties(vnlb_core PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
+if(VNLB_ENABLE_CUDA)
+  add_library(vnlbcu_backend STATIC
+    src/cuda/aggregation.cu
+    src/cuda/block_match.cu
+    src/cuda/frame_cache.cpp
+    src/cuda/group_filter.cu
+    src/cuda/pipeline.cu
+  )
+  add_library(vnlbcu::backend ALIAS vnlbcu_backend)
+  target_include_directories(vnlbcu_backend
+    PUBLIC
+      "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  )
+  target_compile_features(vnlbcu_backend
+    PUBLIC
+      cxx_std_20
+    PRIVATE
+      cuda_std_20
+  )
+  target_link_libraries(vnlbcu_backend
+    PUBLIC
+      CUDA::cudart
+      Threads::Threads
+    PRIVATE
+      CUDA::cublas
+      CUDA::cusolver
+  )
+  set_target_properties(vnlbcu_backend PROPERTIES
+    CXX_EXTENSIONS OFF
+    CUDA_EXTENSIONS OFF
+    POSITION_INDEPENDENT_CODE ON
+    INTERPROCEDURAL_OPTIMIZATION OFF
+  )
+  if(VNLB_CUDA_ARCHITECTURES)
+    set_property(TARGET vnlbcu_backend PROPERTY
+      CUDA_ARCHITECTURES "${VNLB_CUDA_ARCHITECTURES}"
+    )
+  endif()
+
+  if(VNLB_BUILD_BENCHMARKS)
+    add_executable(vnlbcu_block_match_benchmark
+      tools/benchmark_cuda_block_match.cpp
+    )
+    target_link_libraries(vnlbcu_block_match_benchmark
+      PRIVATE
+        vnlbcu_backend
+    )
+    target_compile_features(vnlbcu_block_match_benchmark PRIVATE cxx_std_20)
+    set_target_properties(vnlbcu_block_match_benchmark PROPERTIES
+      CXX_EXTENSIONS OFF
+      INTERPROCEDURAL_OPTIMIZATION OFF
+    )
+
+    add_executable(vnlbcu_group_filter_benchmark
+      tools/benchmark_cuda_group_filter.cpp
+    )
+    target_link_libraries(vnlbcu_group_filter_benchmark
+      PRIVATE
+        vnlbcu_backend
+    )
+    target_compile_features(vnlbcu_group_filter_benchmark PRIVATE cxx_std_20)
+    set_target_properties(vnlbcu_group_filter_benchmark PROPERTIES
+      CXX_EXTENSIONS OFF
+      INTERPROCEDURAL_OPTIMIZATION OFF
+    )
+
+    add_executable(vnlbcu_aggregation_benchmark
+      tools/benchmark_cuda_aggregation.cpp
+    )
+    target_link_libraries(vnlbcu_aggregation_benchmark
+      PRIVATE
+        vnlbcu_backend
+    )
+    set_source_files_properties(tools/benchmark_cuda_aggregation.cpp
+      PROPERTIES LANGUAGE CUDA
+    )
+    target_compile_features(vnlbcu_aggregation_benchmark
+      PRIVATE
+        cxx_std_20
+        cuda_std_20
+    )
+    set_target_properties(vnlbcu_aggregation_benchmark PROPERTIES
+      CXX_EXTENSIONS OFF
+      CUDA_EXTENSIONS OFF
+      INTERPROCEDURAL_OPTIMIZATION OFF
+    )
+    if(VNLB_CUDA_ARCHITECTURES)
+      set_property(TARGET vnlbcu_aggregation_benchmark PROPERTY
+        CUDA_ARCHITECTURES "${VNLB_CUDA_ARCHITECTURES}"
+      )
+    endif()
+  endif()
+endif()
+
 if(VNLB_BUILD_PLUGIN)
   find_package(VapourSynth REQUIRED)
   add_library(vnlb MODULE
@@ -415,6 +558,33 @@ if(VNLB_BUILD_PLUGIN)
     set_target_properties(vnlb PROPERTIES
       SUFFIX ".dylib"
     )
+  endif()
+
+  if(VNLB_ENABLE_CUDA)
+    add_library(vnlbcu MODULE
+      src/vs/cuda_plugin.cpp
+    )
+    target_link_libraries(vnlbcu
+      PRIVATE
+        vnlbcu_backend
+        VapourSynth::VapourSynth
+    )
+    target_include_directories(vnlbcu
+      PRIVATE
+        "${CMAKE_CURRENT_BINARY_DIR}/generated"
+    )
+    target_compile_features(vnlbcu PRIVATE cxx_std_20)
+    set_target_properties(vnlbcu PROPERTIES
+      CXX_EXTENSIONS OFF
+      INTERPROCEDURAL_OPTIMIZATION OFF
+      PREFIX "lib"
+      OUTPUT_NAME "vnlbcu"
+    )
+    if(APPLE)
+      set_target_properties(vnlbcu PROPERTIES
+        SUFFIX ".dylib"
+      )
+    endif()
   endif()
 endif()
 
@@ -452,11 +622,84 @@ if(VNLB_ENABLE_TESTS)
     )
     add_test(NAME core COMMAND vnlb_core_tests)
 
+    if(VNLB_ENABLE_CUDA)
+      add_executable(vnlbcu_group_filter_tests
+        tests/cpp/test_cuda_group_filter.cpp
+      )
+      target_link_libraries(vnlbcu_group_filter_tests
+        PRIVATE
+          vnlbcu_backend
+          vnlb_linalg
+      )
+      target_compile_features(vnlbcu_group_filter_tests PRIVATE cxx_std_20)
+      set_target_properties(vnlbcu_group_filter_tests PROPERTIES
+        CXX_EXTENSIONS OFF
+      )
+      add_test(NAME cuda-group-filter COMMAND vnlbcu_group_filter_tests)
+      set_tests_properties(cuda-group-filter PROPERTIES SKIP_RETURN_CODE 77)
+
+      add_executable(vnlbcu_block_match_tests
+        tests/cpp/test_cuda_block_match.cpp
+      )
+      target_link_libraries(vnlbcu_block_match_tests
+        PRIVATE
+          vnlbcu_backend
+      )
+      target_compile_features(vnlbcu_block_match_tests PRIVATE cxx_std_20)
+      set_target_properties(vnlbcu_block_match_tests PROPERTIES
+        CXX_EXTENSIONS OFF
+      )
+      add_test(NAME cuda-block-match COMMAND vnlbcu_block_match_tests)
+      set_tests_properties(cuda-block-match PROPERTIES SKIP_RETURN_CODE 77)
+
+      add_executable(vnlbcu_aggregation_tests
+        tests/cpp/test_cuda_aggregation.cpp
+      )
+      target_link_libraries(vnlbcu_aggregation_tests
+        PRIVATE
+          vnlbcu_backend
+      )
+      target_compile_features(vnlbcu_aggregation_tests PRIVATE cxx_std_20)
+      set_target_properties(vnlbcu_aggregation_tests PROPERTIES
+        CXX_EXTENSIONS OFF
+      )
+      add_test(NAME cuda-aggregation COMMAND vnlbcu_aggregation_tests)
+      set_tests_properties(cuda-aggregation PROPERTIES SKIP_RETURN_CODE 77)
+
+      add_executable(vnlbcu_pipeline_tests
+        tests/cpp/test_cuda_pipeline.cpp
+      )
+      target_link_libraries(vnlbcu_pipeline_tests
+        PRIVATE
+          vnlbcu_backend
+      )
+      target_compile_features(vnlbcu_pipeline_tests PRIVATE cxx_std_20)
+      set_target_properties(vnlbcu_pipeline_tests PROPERTIES
+        CXX_EXTENSIONS OFF
+      )
+      add_test(NAME cuda-pipeline COMMAND vnlbcu_pipeline_tests)
+      set_tests_properties(cuda-pipeline PROPERTIES SKIP_RETURN_CODE 77)
+
+      add_executable(vnlbcu_frame_cache_tests
+        tests/cpp/test_cuda_frame_cache.cpp
+      )
+      target_link_libraries(vnlbcu_frame_cache_tests
+        PRIVATE
+          vnlbcu_backend
+      )
+      target_compile_features(vnlbcu_frame_cache_tests PRIVATE cxx_std_20)
+      set_target_properties(vnlbcu_frame_cache_tests PROPERTIES
+        CXX_EXTENSIONS OFF
+      )
+      add_test(NAME cuda-frame-cache COMMAND vnlbcu_frame_cache_tests)
+    endif()
+
     if(VNLB_BUILD_PLUGIN)
       add_test(
         NAME reference-comparison
         COMMAND
           "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_isolated_vs.py"
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/compare_reference.py"
           "$<TARGET_FILE:vnlb>"
           "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -467,12 +710,30 @@ if(VNLB_ENABLE_TESTS)
         NAME vs-integration-bestsource
         COMMAND
           "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_isolated_vs.py"
+          --preserve-plugin bs
+          --preserve-plugin mv
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/vs/integration_bestsource.py"
           "$<TARGET_FILE:vnlb>"
           "${CMAKE_CURRENT_SOURCE_DIR}"
           "${CMAKE_CURRENT_BINARY_DIR}/bestsource-cache"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
       )
+
+      if(VNLB_ENABLE_CUDA)
+        add_test(
+          NAME vs-integration-cuda
+          COMMAND
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_isolated_vs.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/vs/integration_cuda.py"
+            "$<TARGET_FILE:vnlbcu>"
+          WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        )
+        set_tests_properties(vs-integration-cuda PROPERTIES
+          SKIP_RETURN_CODE 77
+        )
+      endif()
     endif()
   endif()
 endif()
@@ -483,6 +744,14 @@ message(STATUS "  VNLB_ENABLE_LAPACK: ${VNLB_ENABLE_LAPACK}")
 message(STATUS "  VNLB_ENABLE_ACCELERATE: ${VNLB_ENABLE_ACCELERATE}")
 message(STATUS "  VNLB_USE_LTO: ${VNLB_USE_LTO}")
 message(STATUS "  VNLB_ENABLE_MARCH_NATIVE: ${VNLB_ENABLE_MARCH_NATIVE}")
+message(STATUS "  VNLB_ENABLE_CUDA: ${VNLB_ENABLE_CUDA}")
+message(STATUS "  VNLB_BUILD_BENCHMARKS: ${VNLB_BUILD_BENCHMARKS}")
+if(VNLB_ENABLE_CUDA)
+  message(STATUS "  VNLB_CUDA_ARCHITECTURES: ${VNLB_CUDA_ARCHITECTURES}")
+  message(STATUS "  CMAKE_CUDA_COMPILER: ${CMAKE_CUDA_COMPILER}")
+  message(STATUS "  CMAKE_CUDA_COMPILER_VERSION: ${CMAKE_CUDA_COMPILER_VERSION}")
+  message(STATUS "  CMAKE_CUDA_HOST_COMPILER: ${CMAKE_CUDA_HOST_COMPILER}")
+endif()
 message(STATUS "  VNLB_HIGHWAY_PROVIDER: ${VNLB_HIGHWAY_PROVIDER}")
 message(STATUS "  VNLB_LINALG_BACKEND: ${VNLB_LINALG_BACKEND}")
 message(STATUS "  VNLB_LINALG_USE_ACCELERATE: ${VNLB_LINALG_USE_ACCELERATE}")
