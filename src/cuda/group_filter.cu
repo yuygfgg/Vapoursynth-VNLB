@@ -28,6 +28,13 @@ constexpr int max_basis_similar = 128;
 constexpr float dual_eigenvalue_floor = 128.0F * FLT_EPSILON;
 constexpr double small_group_jacobi_tolerance = 1.0e-7;
 constexpr double large_group_jacobi_tolerance = 1.0e-6;
+// A solver-only diagonal regularizer for exact/zero-signal groups.  The
+// filtered path masks these groups' eigenvalues back to zero, so this cannot
+// change their pixels; it merely keeps cuSOLVER away from a fully zero Gram
+// matrix, which can otherwise report a non-convergence status on some GPUs.
+constexpr float degenerate_gram_jitter = 1.0e-8F;
+constexpr int exact_equal_group = 1;
+constexpr int zero_signal_group = 2;
 
 [[noreturn]] void throw_cuda(cudaError_t status, const char* operation) {
     std::ostringstream message;
@@ -202,14 +209,22 @@ __device__ __forceinline__ int retained_count(const int* counts, int group,
 template <int StaticB, bool UseSharedMean>
 __global__ void prepare_basic_kernel(
     const float* __restrict__ noisy, const int* __restrict__ retained_counts,
+    const std::uint8_t* __restrict__ active_groups,
     int groups, int retained_stride, int sample_dim, int runtime_basis_count,
-    bool detect_equal_groups, float* __restrict__ centers,
+    bool detect_equal_groups, float model_noise2, float* __restrict__ centers,
     float* __restrict__ centered_noisy, int* __restrict__ equal_flags) {
     extern __shared__ float shared[];
     __shared__ int equal_by_warp[warps_per_block];
+    __shared__ float energy_by_warp[warps_per_block];
 
     const int group = static_cast<int>(blockIdx.x);
     if (group >= groups) {
+        return;
+    }
+    if (active_groups != nullptr && active_groups[group] == 0U) {
+        if (threadIdx.x == 0) {
+            equal_flags[group] = 0;
+        }
         return;
     }
     const int similar = retained_count(retained_counts, group, retained_stride);
@@ -241,6 +256,7 @@ __global__ void prepare_basic_kernel(
     __syncthreads();
 
     int local_equal = detect_equal_groups && similar > 1 ? 1 : 0;
+    float local_model_energy = 0.0F;
     const std::size_t centered_count =
         static_cast<std::size_t>(similar) * sample_dim;
     for (std::size_t index = threadIdx.x; index < centered_count;
@@ -252,7 +268,12 @@ __global__ void prepare_basic_kernel(
             value != noisy[group_base + dimension]) {
             local_equal = 0;
         }
-        centered_noisy[group_base + index] = value - mean[dimension];
+        const float centered = value - mean[dimension];
+        centered_noisy[group_base + index] = centered;
+        if (detect_equal_groups && sample < model_count) {
+            local_model_energy =
+                fmaf(centered, centered, local_model_energy);
+        }
     }
 
     if (detect_equal_groups) {
@@ -260,18 +281,24 @@ __global__ void prepare_basic_kernel(
         const int warp = static_cast<int>(threadIdx.x) / warp_width;
         const int warp_equal =
             __all_sync(0xffffffffU, local_equal != 0) ? 1 : 0;
+        const float warp_energy = warp_sum(local_model_energy);
         if (lane == 0) {
             equal_by_warp[warp] = warp_equal;
+            energy_by_warp[warp] = warp_energy;
         }
         __syncthreads();
         if (threadIdx.x == 0) {
             int all_equal = similar > 1 ? 1 : 0;
+            float model_energy = 0.0F;
             for (int candidate = 0; candidate < warps_per_block; ++candidate) {
                 all_equal &= equal_by_warp[candidate];
+                model_energy += energy_by_warp[candidate];
             }
-            equal_flags[group] = all_equal;
+            const float trace = model_energy / static_cast<float>(model_count);
+            equal_flags[group] =
+                all_equal ? exact_equal_group
+                          : (trace <= model_noise2 ? zero_signal_group : 0);
         }
-        __syncthreads();
     }
 }
 
@@ -279,16 +306,25 @@ template <int StaticB, bool UseSharedMean>
 __global__ void prepare_final_kernel(
     const float* __restrict__ noisy, const float* __restrict__ basic,
     const int* __restrict__ retained_counts,
+    const std::uint8_t* __restrict__ active_groups,
     const std::uint8_t* __restrict__ flat_flags, int groups,
     int retained_stride, int sample_dim, int runtime_basis_count,
-    bool detect_equal_groups, float* __restrict__ model_means,
+    bool detect_equal_groups, float model_noise2,
+    float* __restrict__ model_means,
     float* __restrict__ centers, float* __restrict__ centered_noisy,
     float* __restrict__ centered_model, int* __restrict__ equal_flags) {
     extern __shared__ float shared[];
     __shared__ int equal_by_warp[warps_per_block];
+    __shared__ float energy_by_warp[warps_per_block];
 
     const int group = static_cast<int>(blockIdx.x);
     if (group >= groups) {
+        return;
+    }
+    if (active_groups != nullptr && active_groups[group] == 0U) {
+        if (threadIdx.x == 0) {
+            equal_flags[group] = 0;
+        }
         return;
     }
     const int similar = retained_count(retained_counts, group, retained_stride);
@@ -327,12 +363,15 @@ __global__ void prepare_final_kernel(
             flat ? basic_value : noisy_sum / static_cast<float>(model_count);
         model_mean[dimension] = basic_value;
         center[dimension] = center_value;
-        model_mean_global[dimension] = basic_value;
+        if constexpr (!UseSharedMean) {
+            model_mean_global[dimension] = basic_value;
+        }
         center_global[dimension] = center_value;
     }
     __syncthreads();
 
     int local_equal = detect_equal_groups && similar > 1 ? 1 : 0;
+    float local_model_energy = 0.0F;
     const std::size_t centered_count =
         static_cast<std::size_t>(similar) * sample_dim;
     for (std::size_t index = threadIdx.x; index < centered_count;
@@ -344,9 +383,14 @@ __global__ void prepare_final_kernel(
             noisy_value != noisy[group_base + dimension]) {
             local_equal = 0;
         }
-        centered_model[group_base + index] =
+        const float model_value =
             basic[group_base + index] - model_mean[dimension];
+        centered_model[group_base + index] = model_value;
         centered_noisy[group_base + index] = noisy_value - center[dimension];
+        if (detect_equal_groups && sample < model_count) {
+            local_model_energy =
+                fmaf(model_value, model_value, local_model_energy);
+        }
     }
 
     if (detect_equal_groups) {
@@ -354,24 +398,32 @@ __global__ void prepare_final_kernel(
         const int warp = static_cast<int>(threadIdx.x) / warp_width;
         const int warp_equal =
             __all_sync(0xffffffffU, local_equal != 0) ? 1 : 0;
+        const float warp_energy = warp_sum(local_model_energy);
         if (lane == 0) {
             equal_by_warp[warp] = warp_equal;
+            energy_by_warp[warp] = warp_energy;
         }
         __syncthreads();
         if (threadIdx.x == 0) {
             int all_equal = similar > 1 ? 1 : 0;
+            float model_energy = 0.0F;
             for (int candidate = 0; candidate < warps_per_block; ++candidate) {
                 all_equal &= equal_by_warp[candidate];
+                model_energy += energy_by_warp[candidate];
             }
-            equal_flags[group] = all_equal;
+            const float trace = model_energy / static_cast<float>(model_count);
+            equal_flags[group] =
+                all_equal ? exact_equal_group
+                          : (trace <= model_noise2 ? zero_signal_group : 0);
         }
-        __syncthreads();
     }
 }
 
 template <int StaticB, bool UseSharedSamples>
 __global__ void gram_kernel(const float* __restrict__ centered_model,
-                            const int* __restrict__ equal_flags, int groups,
+                            const int* __restrict__ equal_flags,
+                            const std::uint8_t* __restrict__ active_groups,
+                            int groups,
                             int retained_stride, int sample_dim,
                             int runtime_basis_count, float* __restrict__ gram) {
     extern __shared__ float shared_samples[];
@@ -388,11 +440,16 @@ __global__ void gram_kernel(const float* __restrict__ centered_model,
     const std::size_t gram_group_base =
         static_cast<std::size_t>(group) * model_count * model_count;
 
-    if (equal_flags[group] != 0) {
+    const bool inactive =
+        active_groups != nullptr && active_groups[group] == 0U;
+    if (inactive || equal_flags[group] != 0) {
         const int matrix_elements = model_count * model_count;
         for (int index = static_cast<int>(threadIdx.x); index < matrix_elements;
              index += static_cast<int>(blockDim.x)) {
-            gram[gram_group_base + index] = 0.0F;
+            gram[gram_group_base + index] =
+                (index % (model_count + 1)) == 0
+                    ? degenerate_gram_jitter
+                    : 0.0F;
         }
         return;
     }
@@ -444,16 +501,42 @@ __global__ void gram_kernel(const float* __restrict__ centered_model,
     }
 }
 
+__global__ void regularize_flagged_gram_kernel(
+    float* __restrict__ gram, const int* __restrict__ flags,
+    const std::uint8_t* __restrict__ active_groups, int groups,
+    int basis_similar, float diagonal_jitter) {
+    const int group = static_cast<int>(blockIdx.x);
+    if (group >= groups) {
+        return;
+    }
+    const bool inactive =
+        active_groups != nullptr && active_groups[group] == 0U;
+    if (!inactive && flags[group] == 0) {
+        return;
+    }
+    const int matrix_elements = basis_similar * basis_similar;
+    const std::size_t group_base =
+        static_cast<std::size_t>(group) * matrix_elements;
+    for (int index = static_cast<int>(threadIdx.x); index < matrix_elements;
+         index += static_cast<int>(blockDim.x)) {
+        gram[group_base + index] =
+            (index % (basis_similar + 1)) == 0 ? diagonal_jitter : 0.0F;
+    }
+}
+
 template <int StaticB>
 __global__ void map_dual_basis_kernel(
     const float* __restrict__ centered_model,
     const float* __restrict__ eigenvectors_column_major,
     const float* __restrict__ eigenvalues_ascending,
-    const int* __restrict__ equal_flags, int groups, int retained_stride,
+    const int* __restrict__ equal_flags,
+    const std::uint8_t* __restrict__ active_groups, int groups,
+    int retained_stride,
     int sample_dim, int runtime_basis_count, int rank,
     float* __restrict__ selected_eigenvalues, float* __restrict__ basis) {
     const int group = static_cast<int>(blockIdx.x);
-    if (group >= groups) {
+    if (group >= groups ||
+        (active_groups != nullptr && active_groups[group] == 0U)) {
         return;
     }
     const int model_count = basis_count<StaticB>(runtime_basis_count);
@@ -522,30 +605,34 @@ __global__ void map_dual_basis_kernel(
     }
 }
 
-template <Stage stage, bool UseSharedBasis>
+template <Stage stage, bool UseSharedBasis, bool UseSharedScores>
 __global__ void filter_and_weight_kernel(
     const float* __restrict__ noisy_samples,
     const float* __restrict__ centered_noisy,
     const float* __restrict__ centered_model, const float* __restrict__ centers,
     const float* __restrict__ selected_eigenvalues,
     const float* __restrict__ basis, const int* __restrict__ retained_counts,
-    const int* __restrict__ equal_flags, int groups, int retained_stride,
+    const int* __restrict__ equal_flags,
+    const std::uint8_t* __restrict__ active_groups, int groups,
+    int retained_stride,
     int sample_dim, int model_count, int rank, FilterParameters parameters,
     float* __restrict__ filtered, float* __restrict__ scores,
     float* __restrict__ log_patch_weights) {
     extern __shared__ float shared[];
     float* const filter_coefficients = shared;
     float* const signal_eigenvalues = filter_coefficients + rank;
-    float* const projection_cache = signal_eigenvalues + rank;
-    float* const shared_basis =
-        projection_cache + static_cast<std::size_t>(warps_per_block) * rank;
+    float* const shared_basis = signal_eigenvalues + rank;
+    float* const shared_scores =
+        shared_basis +
+        (UseSharedBasis ? static_cast<std::size_t>(rank) * sample_dim : 0U);
     __shared__ float warp_minima[warps_per_block];
     __shared__ float minimum_score;
     __shared__ float log_group_weight;
     __shared__ float membership_volume;
 
     const int group = static_cast<int>(blockIdx.x);
-    if (group >= groups) {
+    if (group >= groups ||
+        (active_groups != nullptr && active_groups[group] == 0U)) {
         return;
     }
     const int similar = retained_count(retained_counts, group, retained_stride);
@@ -562,8 +649,10 @@ __global__ void filter_and_weight_kernel(
         static_cast<std::size_t>(group) * rank * sample_dim;
     const std::size_t score_base =
         static_cast<std::size_t>(group) * retained_stride;
+    float* const patch_scores =
+        UseSharedScores ? shared_scores : scores + score_base;
 
-    if (equal_flags[group] != 0) {
+    if (equal_flags[group] == exact_equal_group) {
         const std::size_t count =
             static_cast<std::size_t>(similar) * sample_dim;
         for (std::size_t index = threadIdx.x; index < count;
@@ -618,7 +707,7 @@ __global__ void filter_and_weight_kernel(
                 : 0.0F;
         signal_eigenvalues[component] = variance;
     }
-    __syncthreads();
+    __syncwarp();
 
     if (threadIdx.x == 0) {
         float trace = 0.0F;
@@ -657,8 +746,7 @@ __global__ void filter_and_weight_kernel(
     for (int patch = warp; patch < similar; patch += warps_per_block) {
         const std::size_t sample_base =
             group_base + static_cast<std::size_t>(patch) * sample_dim;
-        float* const cached_projection =
-            projection_cache + static_cast<std::size_t>(warp) * rank;
+        float owned_projection = 0.0F;
 
         for (int component = 0; component < rank; ++component) {
             float projection = 0.0F;
@@ -670,23 +758,33 @@ __global__ void filter_and_weight_kernel(
                               group_basis[basis_row + dimension];
             }
             projection = warp_sum(projection);
-            if (lane == 0) {
-                cached_projection[component] = projection;
+            projection = __shfl_sync(0xffffffffU, projection, 0);
+            if (lane == component) {
+                owned_projection = projection;
             }
         }
-        __syncwarp();
 
-        for (int dimension = lane; dimension < sample_dim;
-             dimension += warp_width) {
-            float estimate = centers[center_base + dimension];
+        // Keep every lane participating in each shuffle, including the final
+        // partial row when sample_dim is not a multiple of the warp width.
+        for (int dimension_base = 0; dimension_base < sample_dim;
+             dimension_base += warp_width) {
+            const int dimension = dimension_base + lane;
+            float estimate = dimension < sample_dim
+                                 ? centers[center_base + dimension]
+                                 : 0.0F;
             for (int component = 0; component < rank; ++component) {
+                const float projection =
+                    __shfl_sync(0xffffffffU, owned_projection, component);
                 const std::size_t basis_row =
                     static_cast<std::size_t>(component) * sample_dim;
-                estimate += filter_coefficients[component] *
-                            cached_projection[component] *
-                            group_basis[basis_row + dimension];
+                if (dimension < sample_dim) {
+                    estimate += filter_coefficients[component] * projection *
+                                group_basis[basis_row + dimension];
+                }
             }
-            filtered[sample_base + dimension] = estimate;
+            if (dimension < sample_dim) {
+                filtered[sample_base + dimension] = estimate;
+            }
         }
 
         if (log_patch_weights == nullptr) {
@@ -718,26 +816,29 @@ __global__ void filter_and_weight_kernel(
                                   group_basis[basis_row + dimension];
                 }
                 projection = warp_sum(projection);
-                if (lane == 0) {
-                    cached_projection[component] = projection;
+                projection = __shfl_sync(0xffffffffU, projection, 0);
+                if (lane == component) {
+                    owned_projection = projection;
                 }
             }
-            __syncwarp();
         }
 
-        if (lane == 0) {
-            float distance = 0.0F;
-            float projected_norm2 = 0.0F;
-            for (int component = 0; component < rank; ++component) {
-                const float projection = cached_projection[component];
+        float distance = 0.0F;
+        float projected_norm2 = 0.0F;
+        for (int component = 0; component < rank; ++component) {
+            const float projection =
+                __shfl_sync(0xffffffffU, owned_projection, component);
+            if (lane == 0) {
                 const float projection2 = projection * projection;
                 distance += projection2 /
                             (signal_eigenvalues[component] + membership_noise2);
                 projected_norm2 += projection2;
             }
+        }
+        if (lane == 0) {
             const float residual_norm2 = fmaxf(norm2 - projected_norm2, 0.0F);
             distance += residual_norm2 / membership_noise2;
-            scores[score_base + patch] =
+            patch_scores[patch] =
                 (distance - static_cast<float>(sample_dim)) /
                 sqrtf(2.0F * static_cast<float>(sample_dim));
         }
@@ -751,7 +852,7 @@ __global__ void filter_and_weight_kernel(
     float local_minimum = CUDART_INF_F;
     for (int patch = static_cast<int>(threadIdx.x); patch < similar;
          patch += static_cast<int>(blockDim.x)) {
-        local_minimum = fminf(local_minimum, scores[score_base + patch]);
+        local_minimum = fminf(local_minimum, patch_scores[patch]);
     }
     local_minimum = warp_min(local_minimum);
     if (lane == 0) {
@@ -772,10 +873,239 @@ __global__ void filter_and_weight_kernel(
     for (int patch = static_cast<int>(threadIdx.x); patch < similar;
          patch += static_cast<int>(blockDim.x)) {
         const float membership =
-            fmaxf(scores[score_base + patch] - minimum_score, 0.0F) +
+            fmaxf(patch_scores[patch] - minimum_score, 0.0F) +
             membership_volume;
         log_patch_weights[score_base + patch] =
             log_group_weight - parameters.weight_beta * membership;
+    }
+}
+
+template <Stage stage>
+__global__ void projected_filter_and_weight_kernel(
+    const float* __restrict__ centered_model,
+    const float* __restrict__ selected_eigenvalues,
+    const int* __restrict__ retained_counts,
+    const int* __restrict__ equal_flags,
+    const std::uint8_t* __restrict__ active_groups, int groups,
+    int retained_stride,
+    int sample_dim, int model_count, int rank, FilterParameters parameters,
+    float* __restrict__ noisy_projections,
+    const float* __restrict__ model_projections,
+    float* __restrict__ scores, float* __restrict__ log_patch_weights) {
+    extern __shared__ float shared[];
+    float* const filter_coefficients = shared;
+    float* const signal_eigenvalues = filter_coefficients + rank;
+    __shared__ float warp_minima[warps_per_block];
+    __shared__ float minimum_score;
+    __shared__ float log_group_weight;
+    __shared__ float membership_volume;
+
+    const int group = static_cast<int>(blockIdx.x);
+    if (group >= groups ||
+        (active_groups != nullptr && active_groups[group] == 0U)) {
+        return;
+    }
+    const int similar = retained_count(retained_counts, group, retained_stride);
+    const int lane = static_cast<int>(threadIdx.x) & (warp_width - 1);
+    const int warp = static_cast<int>(threadIdx.x) / warp_width;
+    const std::size_t sample_group_base =
+        static_cast<std::size_t>(group) * retained_stride * sample_dim;
+    const std::size_t projection_group_base =
+        static_cast<std::size_t>(group) * retained_stride * rank;
+    const std::size_t eigen_base = static_cast<std::size_t>(group) * rank;
+    const std::size_t score_base =
+        static_cast<std::size_t>(group) * retained_stride;
+
+    const float estimate_noise2 =
+        parameters.beta * parameters.sigma * parameters.sigma;
+    float model_noise2 = estimate_noise2;
+    if constexpr (stage == Stage::Final) {
+        model_noise2 =
+            parameters.beta * parameters.sigma_basic * parameters.sigma_basic;
+    }
+    const float filter_threshold =
+        parameters.variance_threshold * estimate_noise2;
+
+    for (int component = static_cast<int>(threadIdx.x); component < rank;
+         component += static_cast<int>(blockDim.x)) {
+        const float observed = selected_eigenvalues[eigen_base + component];
+        const float variance = fmaxf(observed - model_noise2, 0.0F);
+        filter_coefficients[component] =
+            variance > filter_threshold
+                ? 1.0F / (1.0F + (estimate_noise2 / variance))
+                : 0.0F;
+        signal_eigenvalues[component] = variance;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float trace = 0.0F;
+        float volume = 0.0F;
+        const float match_sigma =
+            stage == Stage::Final ? parameters.sigma_basic : parameters.sigma;
+        const float membership_noise2 = fmaxf(
+            match_sigma * match_sigma,
+            parameters.membership_noise_floor * parameters.sigma *
+                parameters.sigma);
+        for (int component = 0; component < rank; ++component) {
+            const float lambda = signal_eigenvalues[component];
+            if (lambda > 0.0F) {
+                trace += lambda / (lambda + estimate_noise2);
+                if (parameters.weight_beta != 0.0F) {
+                    volume += log1pf(lambda / membership_noise2);
+                }
+            }
+        }
+        const float tau =
+            parameters.weight_epsilon +
+            static_cast<float>(sample_dim) / static_cast<float>(model_count) +
+            trace;
+        log_group_weight = parameters.weight_alpha == 0.0F
+                               ? 0.0F
+                               : -parameters.weight_alpha * logf(tau);
+        membership_volume = volume / static_cast<float>(sample_dim);
+    }
+    __syncthreads();
+
+    if (equal_flags[group] == exact_equal_group) {
+        const std::size_t projection_count =
+            static_cast<std::size_t>(similar) * rank;
+        for (std::size_t index = threadIdx.x; index < projection_count;
+             index += blockDim.x) {
+            noisy_projections[projection_group_base + index] = 0.0F;
+        }
+        if (log_patch_weights != nullptr) {
+            for (int patch = static_cast<int>(threadIdx.x); patch < similar;
+                 patch += static_cast<int>(blockDim.x)) {
+                log_patch_weights[score_base + patch] = log_group_weight;
+            }
+        }
+        return;
+    }
+
+    if (log_patch_weights != nullptr && parameters.weight_beta != 0.0F) {
+        const float match_sigma = stage == Stage::Final
+                                      ? parameters.sigma_basic
+                                      : parameters.sigma;
+        const float membership_noise2 = fmaxf(
+            match_sigma * match_sigma,
+            parameters.membership_noise_floor * parameters.sigma *
+                parameters.sigma);
+        const float* const membership_projections =
+            stage == Stage::Final ? model_projections : noisy_projections;
+
+        for (int patch = warp; patch < similar; patch += warps_per_block) {
+            const std::size_t sample_base =
+                sample_group_base +
+                static_cast<std::size_t>(patch) * sample_dim;
+            float norm2 = 0.0F;
+            for (int dimension = lane; dimension < sample_dim;
+                 dimension += warp_width) {
+                const float value = centered_model[sample_base + dimension];
+                norm2 = fmaf(value, value, norm2);
+            }
+            norm2 = warp_sum(norm2);
+
+            if (lane == 0) {
+                const std::size_t projection_base =
+                    projection_group_base +
+                    static_cast<std::size_t>(patch) * rank;
+                float distance = 0.0F;
+                float projected_norm2 = 0.0F;
+                for (int component = 0; component < rank; ++component) {
+                    const float projection =
+                        membership_projections[projection_base + component];
+                    const float projection2 = projection * projection;
+                    distance += projection2 /
+                                (signal_eigenvalues[component] +
+                                 membership_noise2);
+                    projected_norm2 += projection2;
+                }
+                const float residual_norm2 =
+                    fmaxf(norm2 - projected_norm2, 0.0F);
+                distance += residual_norm2 / membership_noise2;
+                scores[score_base + patch] =
+                    (distance - static_cast<float>(sample_dim)) /
+                    sqrtf(2.0F * static_cast<float>(sample_dim));
+            }
+        }
+        __syncthreads();
+
+        float local_minimum = CUDART_INF_F;
+        for (int patch = static_cast<int>(threadIdx.x); patch < similar;
+             patch += static_cast<int>(blockDim.x)) {
+            local_minimum =
+                fminf(local_minimum, scores[score_base + patch]);
+        }
+        local_minimum = warp_min(local_minimum);
+        if (lane == 0) {
+            warp_minima[warp] = local_minimum;
+        }
+        __syncthreads();
+
+        if (warp == 0) {
+            float block_minimum =
+                lane < warps_per_block ? warp_minima[lane] : CUDART_INF_F;
+            block_minimum = warp_min(block_minimum);
+            if (lane == 0) {
+                minimum_score = block_minimum;
+            }
+        }
+        __syncthreads();
+
+        for (int patch = static_cast<int>(threadIdx.x); patch < similar;
+             patch += static_cast<int>(blockDim.x)) {
+            const float membership =
+                fmaxf(scores[score_base + patch] - minimum_score, 0.0F) +
+                membership_volume;
+            log_patch_weights[score_base + patch] =
+                log_group_weight - parameters.weight_beta * membership;
+        }
+    } else if (log_patch_weights != nullptr) {
+        for (int patch = static_cast<int>(threadIdx.x); patch < similar;
+             patch += static_cast<int>(blockDim.x)) {
+            log_patch_weights[score_base + patch] = log_group_weight;
+        }
+    }
+    __syncthreads();
+
+    const std::size_t projection_count =
+        static_cast<std::size_t>(similar) * rank;
+    for (std::size_t index = threadIdx.x; index < projection_count;
+         index += blockDim.x) {
+        const int component = static_cast<int>(index % rank);
+        noisy_projections[projection_group_base + index] *=
+            filter_coefficients[component];
+    }
+}
+
+__global__ void add_filter_centers_kernel(
+    const float* __restrict__ centered_noisy,
+    const float* __restrict__ centers,
+    const int* __restrict__ retained_counts,
+    const int* __restrict__ equal_flags,
+    const std::uint8_t* __restrict__ active_groups, int groups,
+    int retained_stride,
+    int sample_dim, float* __restrict__ filtered) {
+    const int group = static_cast<int>(blockIdx.x);
+    if (group >= groups ||
+        (active_groups != nullptr && active_groups[group] == 0U)) {
+        return;
+    }
+    const int similar = retained_count(retained_counts, group, retained_stride);
+    const std::size_t group_base =
+        static_cast<std::size_t>(group) * retained_stride * sample_dim;
+    const std::size_t center_base =
+        static_cast<std::size_t>(group) * sample_dim;
+    const std::size_t count = static_cast<std::size_t>(similar) * sample_dim;
+    const bool exact = equal_flags[group] == exact_equal_group;
+    for (std::size_t index = threadIdx.x; index < count;
+         index += blockDim.x) {
+        const int dimension = static_cast<int>(index % sample_dim);
+        const float center = centers[center_base + dimension];
+        filtered[group_base + index] =
+            exact ? centered_noisy[group_base + index] + center
+                  : filtered[group_base + index] + center;
     }
 }
 
@@ -844,22 +1174,30 @@ void launch_prepare(const GroupBatchShape& shape,
                     bool final_shared, cudaStream_t stream) {
     const dim3 grid(static_cast<unsigned int>(shape.groups));
     const dim3 block(block_threads);
+    const float estimate_noise2 =
+        parameters.beta * parameters.sigma * parameters.sigma;
+    const float model_noise2 =
+        parameters.stage == Stage::Final
+            ? parameters.beta * parameters.sigma_basic * parameters.sigma_basic
+            : estimate_noise2;
     if (parameters.stage == Stage::Basic) {
         const std::size_t shared_bytes =
             static_cast<std::size_t>(shape.sample_dim) * sizeof(float);
         if (basic_shared) {
             prepare_basic_kernel<StaticB, true>
                 <<<grid, block, shared_bytes, stream>>>(
-                    batch.noisy_samples, batch.retained_counts, shape.groups,
-                    shape.retained_stride, shape.sample_dim,
+                    batch.noisy_samples, batch.retained_counts,
+                    batch.active_groups, shape.groups, shape.retained_stride,
+                    shape.sample_dim,
                     shape.basis_similar, parameters.detect_equal_groups,
-                    centers, centered_noisy, equal_flags);
+                    model_noise2, centers, centered_noisy, equal_flags);
         } else {
             prepare_basic_kernel<StaticB, false><<<grid, block, 0, stream>>>(
-                batch.noisy_samples, batch.retained_counts, shape.groups,
-                shape.retained_stride, shape.sample_dim, shape.basis_similar,
-                parameters.detect_equal_groups, centers, centered_noisy,
-                equal_flags);
+                batch.noisy_samples, batch.retained_counts,
+                batch.active_groups, shape.groups, shape.retained_stride,
+                shape.sample_dim, shape.basis_similar,
+                parameters.detect_equal_groups, model_noise2, centers,
+                centered_noisy, equal_flags);
         }
     } else {
         const std::size_t shared_bytes =
@@ -868,27 +1206,40 @@ void launch_prepare(const GroupBatchShape& shape,
             prepare_final_kernel<StaticB, true>
                 <<<grid, block, shared_bytes, stream>>>(
                     batch.noisy_samples, batch.basic_samples,
-                    batch.retained_counts, batch.flat_flags, shape.groups,
-                    shape.retained_stride, shape.sample_dim,
+                    batch.retained_counts, batch.active_groups,
+                    batch.flat_flags, shape.groups, shape.retained_stride,
+                    shape.sample_dim,
                     shape.basis_similar, parameters.detect_equal_groups,
-                    model_means, centers, centered_noisy, centered_model,
-                    equal_flags);
+                    model_noise2, model_means, centers, centered_noisy,
+                    centered_model, equal_flags);
         } else {
             prepare_final_kernel<StaticB, false><<<grid, block, 0, stream>>>(
                 batch.noisy_samples, batch.basic_samples, batch.retained_counts,
-                batch.flat_flags, shape.groups, shape.retained_stride,
-                shape.sample_dim, shape.basis_similar,
-                parameters.detect_equal_groups, model_means, centers,
-                centered_noisy, centered_model, equal_flags);
+                batch.active_groups, batch.flat_flags, shape.groups,
+                shape.retained_stride, shape.sample_dim, shape.basis_similar,
+                parameters.detect_equal_groups, model_noise2, model_means,
+                centers, centered_noisy, centered_model, equal_flags);
         }
     }
     check_cuda(cudaPeekAtLastError(), "launch group preparation kernel");
 }
 
+void launch_regularize_flagged_gram(
+    const GroupBatchShape& shape, float* gram, const int* flags,
+    const std::uint8_t* active_groups, cudaStream_t stream) {
+    regularize_flagged_gram_kernel<<<static_cast<unsigned int>(shape.groups),
+                                     block_threads, 0, stream>>>(
+        gram, flags, active_groups, shape.groups, shape.basis_similar,
+        degenerate_gram_jitter);
+    check_cuda(cudaPeekAtLastError(),
+               "launch flagged Gram regularization kernel");
+}
+
 template <int StaticB>
 void launch_gram(const GroupBatchShape& shape, const float* centered_model,
-                 const int* equal_flags, float* gram, bool use_shared_samples,
-                 cudaStream_t stream) {
+                 const int* equal_flags,
+                 const std::uint8_t* active_groups, float* gram,
+                 bool use_shared_samples, cudaStream_t stream) {
     const std::size_t shared_bytes =
         static_cast<std::size_t>(shape.basis_similar) * shape.sample_dim *
         sizeof(float);
@@ -896,12 +1247,12 @@ void launch_gram(const GroupBatchShape& shape, const float* centered_model,
     const dim3 block(block_threads);
     if (use_shared_samples) {
         gram_kernel<StaticB, true><<<grid, block, shared_bytes, stream>>>(
-            centered_model, equal_flags, shape.groups, shape.retained_stride,
-            shape.sample_dim, shape.basis_similar, gram);
+            centered_model, equal_flags, active_groups, shape.groups,
+            shape.retained_stride, shape.sample_dim, shape.basis_similar, gram);
     } else {
         gram_kernel<StaticB, false><<<grid, block, 0, stream>>>(
-            centered_model, equal_flags, shape.groups, shape.retained_stride,
-            shape.sample_dim, shape.basis_similar, gram);
+            centered_model, equal_flags, active_groups, shape.groups,
+            shape.retained_stride, shape.sample_dim, shape.basis_similar, gram);
     }
     check_cuda(cudaPeekAtLastError(), "launch Gram kernel");
 }
@@ -909,14 +1260,16 @@ void launch_gram(const GroupBatchShape& shape, const float* centered_model,
 template <int StaticB>
 void launch_map_basis(const GroupBatchShape& shape, const float* centered_model,
                       const float* gram, const float* raw_eigenvalues,
-                      const int* equal_flags, float* selected_eigenvalues,
-                      float* basis, cudaStream_t stream) {
+                      const int* equal_flags,
+                      const std::uint8_t* active_groups,
+                      float* selected_eigenvalues, float* basis,
+                      cudaStream_t stream) {
     const dim3 grid(static_cast<unsigned int>(shape.groups));
     const dim3 block(block_threads);
     map_dual_basis_kernel<StaticB><<<grid, block, 0, stream>>>(
-        centered_model, gram, raw_eigenvalues, equal_flags, shape.groups,
-        shape.retained_stride, shape.sample_dim, shape.basis_similar,
-        shape.rank, selected_eigenvalues, basis);
+        centered_model, gram, raw_eigenvalues, equal_flags, active_groups,
+        shape.groups, shape.retained_stride, shape.sample_dim,
+        shape.basis_similar, shape.rank, selected_eigenvalues, basis);
     check_cuda(cudaPeekAtLastError(), "launch dual-basis mapping kernel");
 }
 
@@ -925,12 +1278,11 @@ void launch_filter(const GroupBatchShape& shape,
                    const FilterParameters& parameters,
                    const DeviceGroupBatch& batch, const float* centered_noisy,
                    const float* centered_model, const float* centers,
-                   const float* selected_eigenvalues, const float* basis,
-                   const int* equal_flags, float* scores, bool use_shared_basis,
-                   cudaStream_t stream) {
+    const float* selected_eigenvalues, const float* basis,
+    const int* equal_flags, float* scores, bool use_shared_basis,
+    bool use_shared_scores, cudaStream_t stream) {
     const std::size_t control_values = checked_product(
-        static_cast<std::size_t>(shape.rank),
-        static_cast<std::size_t>(warps_per_block + 2),
+        static_cast<std::size_t>(shape.rank), 2U,
         "CUDA filter control cache size overflows");
     std::size_t shared_values = control_values;
     if (use_shared_basis) {
@@ -941,6 +1293,11 @@ void launch_filter(const GroupBatchShape& shape,
                             "CUDA shared basis size overflows"),
             "CUDA filter shared memory size overflows");
     }
+    if (use_shared_scores) {
+        shared_values = checked_sum(
+            shared_values, static_cast<std::size_t>(shape.retained_stride),
+            "CUDA filter shared memory size overflows");
+    }
     const std::size_t shared_bytes =
         checked_product(shared_values, sizeof(float),
                         "CUDA filter shared memory size overflows");
@@ -948,23 +1305,86 @@ void launch_filter(const GroupBatchShape& shape,
     const dim3 block(block_threads);
 
     if (use_shared_basis) {
-        filter_and_weight_kernel<stage, true>
-            <<<grid, block, shared_bytes, stream>>>(
-                batch.noisy_samples, centered_noisy, centered_model, centers,
-                selected_eigenvalues, basis, batch.retained_counts, equal_flags,
-                shape.groups, shape.retained_stride, shape.sample_dim,
-                shape.basis_similar, shape.rank, parameters,
-                batch.filtered_samples, scores, batch.log_patch_weights);
+        if (use_shared_scores) {
+            filter_and_weight_kernel<stage, true, true>
+                <<<grid, block, shared_bytes, stream>>>(
+                    batch.noisy_samples, centered_noisy, centered_model,
+                    centers, selected_eigenvalues, basis,
+                    batch.retained_counts, equal_flags, batch.active_groups,
+                    shape.groups, shape.retained_stride, shape.sample_dim,
+                    shape.basis_similar, shape.rank, parameters,
+                    batch.filtered_samples, scores, batch.log_patch_weights);
+        } else {
+            filter_and_weight_kernel<stage, true, false>
+                <<<grid, block, shared_bytes, stream>>>(
+                    batch.noisy_samples, centered_noisy, centered_model,
+                    centers, selected_eigenvalues, basis,
+                    batch.retained_counts, equal_flags, batch.active_groups,
+                    shape.groups, shape.retained_stride, shape.sample_dim,
+                    shape.basis_similar, shape.rank, parameters,
+                    batch.filtered_samples, scores, batch.log_patch_weights);
+        }
     } else {
-        filter_and_weight_kernel<stage, false>
-            <<<grid, block, shared_bytes, stream>>>(
-            batch.noisy_samples, centered_noisy, centered_model, centers,
-            selected_eigenvalues, basis, batch.retained_counts, equal_flags,
-            shape.groups, shape.retained_stride, shape.sample_dim,
-            shape.basis_similar, shape.rank, parameters, batch.filtered_samples,
-            scores, batch.log_patch_weights);
+        if (use_shared_scores) {
+            filter_and_weight_kernel<stage, false, true>
+                <<<grid, block, shared_bytes, stream>>>(
+                    batch.noisy_samples, centered_noisy, centered_model,
+                    centers, selected_eigenvalues, basis,
+                    batch.retained_counts, equal_flags, batch.active_groups,
+                    shape.groups, shape.retained_stride, shape.sample_dim,
+                    shape.basis_similar, shape.rank, parameters,
+                    batch.filtered_samples, scores, batch.log_patch_weights);
+        } else {
+            filter_and_weight_kernel<stage, false, false>
+                <<<grid, block, shared_bytes, stream>>>(
+                    batch.noisy_samples, centered_noisy, centered_model,
+                    centers, selected_eigenvalues, basis,
+                    batch.retained_counts, equal_flags, batch.active_groups,
+                    shape.groups, shape.retained_stride, shape.sample_dim,
+                    shape.basis_similar, shape.rank, parameters,
+                    batch.filtered_samples, scores, batch.log_patch_weights);
+        }
     }
     check_cuda(cudaPeekAtLastError(), "launch filter/weight kernel");
+}
+
+template <Stage stage>
+void launch_projected_filter(
+    const GroupBatchShape& shape, const FilterParameters& parameters,
+    const DeviceGroupBatch& batch, const float* centered_model,
+    const float* selected_eigenvalues, const int* equal_flags,
+    float* noisy_projections, const float* model_projections, float* scores,
+    cudaStream_t stream) {
+    const std::size_t shared_bytes = checked_product(
+        checked_product(static_cast<std::size_t>(shape.rank), 2U,
+                        "CUDA projected filter cache size overflows"),
+        sizeof(float), "CUDA projected filter cache bytes overflow");
+    projected_filter_and_weight_kernel<stage>
+        <<<static_cast<unsigned int>(shape.groups), block_threads,
+           shared_bytes, stream>>>(
+            centered_model, selected_eigenvalues, batch.retained_counts,
+            equal_flags, batch.active_groups, shape.groups,
+            shape.retained_stride,
+            shape.sample_dim, shape.basis_similar, shape.rank, parameters,
+            noisy_projections, model_projections, scores,
+            batch.log_patch_weights);
+    check_cuda(cudaPeekAtLastError(),
+               "launch projected filter/weight kernel");
+}
+
+void launch_add_filter_centers(const GroupBatchShape& shape,
+                               const DeviceGroupBatch& batch,
+                               const float* centered_noisy,
+                               const float* centers,
+                               const int* equal_flags,
+                               cudaStream_t stream) {
+    add_filter_centers_kernel<<<static_cast<unsigned int>(shape.groups),
+                                block_threads, 0, stream>>>(
+        centered_noisy, centers, batch.retained_counts, equal_flags,
+        batch.active_groups, shape.groups, shape.retained_stride,
+        shape.sample_dim,
+        batch.filtered_samples);
+    check_cuda(cudaPeekAtLastError(), "launch filter center-add kernel");
 }
 
 template <typename Function>
@@ -1083,6 +1503,9 @@ class GroupFilter::Impl {
         const std::size_t score_values = checked_product(
             groups, static_cast<std::size_t>(shape.retained_stride),
             "CUDA score batch size overflows");
+        const std::size_t projection_values = checked_product(
+            score_values, static_cast<std::size_t>(shape.rank),
+            "CUDA projection batch size overflows");
 
         centered_noisy_.reserve(sample_values);
         centered_model_.reserve(sample_values);
@@ -1093,6 +1516,12 @@ class GroupFilter::Impl {
         selected_eigenvalues_.reserve(selected_values);
         basis_.reserve(basis_values);
         scores_.reserve(score_values);
+        use_cublas_filter_ =
+            shape.basis_similar > warp_width && shape.rank > 0;
+        if (use_cublas_filter_) {
+            noisy_projections_.reserve(projection_values);
+            model_projections_.reserve(projection_values);
+        }
         equal_flags_.reserve(groups);
         solver_info_.reserve(groups);
 
@@ -1115,8 +1544,7 @@ class GroupFilter::Impl {
                 default_shared_memory_, optin_shared_memory_);
         });
         const std::size_t filter_control_values = checked_product(
-            static_cast<std::size_t>(shape.rank),
-            static_cast<std::size_t>(warps_per_block + 2),
+            static_cast<std::size_t>(shape.rank), 2U,
             "CUDA filter control cache size overflows");
         const std::size_t filter_control_bytes =
             checked_product(filter_control_values, sizeof(float),
@@ -1129,36 +1557,82 @@ class GroupFilter::Impl {
         const std::size_t filter_with_basis_bytes = checked_sum(
             filter_control_bytes, filter_basis_bytes,
             "CUDA filter shared memory size overflows");
+        const std::size_t filter_score_bytes = checked_product(
+            static_cast<std::size_t>(shape.retained_stride), sizeof(float),
+            "CUDA shared score size overflows");
+        const std::size_t filter_with_scores_bytes = checked_sum(
+            filter_control_bytes, filter_score_bytes,
+            "CUDA filter shared memory size overflows");
+        const std::size_t filter_with_basis_scores_bytes = checked_sum(
+            filter_with_basis_bytes, filter_score_bytes,
+            "CUDA filter shared memory size overflows");
         const bool filter_basic_control = configure_dynamic_shared(
-            filter_and_weight_kernel<Stage::Basic, false>,
+            filter_and_weight_kernel<Stage::Basic, false, false>,
             filter_control_bytes, default_shared_memory_,
             optin_shared_memory_);
         const bool filter_final_control = configure_dynamic_shared(
-            filter_and_weight_kernel<Stage::Final, false>,
+            filter_and_weight_kernel<Stage::Final, false, false>,
             filter_control_bytes, default_shared_memory_,
             optin_shared_memory_);
         if (!filter_basic_control || !filter_final_control) {
             throw std::runtime_error(
                 "CUDA filter rank cache does not fit device shared memory");
         }
-        filter_basic_shared_ =
-            shape.rank > 0 &&
-            configure_dynamic_shared(
-                filter_and_weight_kernel<Stage::Basic, true>,
-                filter_with_basis_bytes, default_shared_memory_,
-                optin_shared_memory_);
-        filter_final_shared_ =
-            shape.rank > 0 &&
-            configure_dynamic_shared(
-                filter_and_weight_kernel<Stage::Final, true>,
-                filter_with_basis_bytes, default_shared_memory_,
-                optin_shared_memory_);
+        filter_basic_shared_ = false;
+        filter_basic_scores_ = false;
+        if (shape.rank > 0 && configure_dynamic_shared(
+                                  filter_and_weight_kernel<Stage::Basic, true,
+                                                           true>,
+                                  filter_with_basis_scores_bytes,
+                                  default_shared_memory_,
+                                  optin_shared_memory_)) {
+            filter_basic_shared_ = true;
+            filter_basic_scores_ = true;
+        } else {
+            filter_basic_shared_ =
+                shape.rank > 0 &&
+                configure_dynamic_shared(
+                    filter_and_weight_kernel<Stage::Basic, true, false>,
+                    filter_with_basis_bytes, default_shared_memory_,
+                    optin_shared_memory_);
+            if (!filter_basic_shared_) {
+                filter_basic_scores_ = configure_dynamic_shared(
+                    filter_and_weight_kernel<Stage::Basic, false, true>,
+                    filter_with_scores_bytes, default_shared_memory_,
+                    optin_shared_memory_);
+            }
+        }
+
+        filter_final_shared_ = false;
+        filter_final_scores_ = false;
+        if (shape.rank > 0 && configure_dynamic_shared(
+                                  filter_and_weight_kernel<Stage::Final, true,
+                                                           true>,
+                                  filter_with_basis_scores_bytes,
+                                  default_shared_memory_,
+                                  optin_shared_memory_)) {
+            filter_final_shared_ = true;
+            filter_final_scores_ = true;
+        } else {
+            filter_final_shared_ =
+                shape.rank > 0 &&
+                configure_dynamic_shared(
+                    filter_and_weight_kernel<Stage::Final, true, false>,
+                    filter_with_basis_bytes, default_shared_memory_,
+                    optin_shared_memory_);
+            if (!filter_final_shared_) {
+                filter_final_scores_ = configure_dynamic_shared(
+                    filter_and_weight_kernel<Stage::Final, false, true>,
+                    filter_with_scores_bytes, default_shared_memory_,
+                    optin_shared_memory_);
+            }
+        }
 
         use_cublas_gram_ = shape.basis_similar > warp_width;
         solver_lwork_ = 0;
         if (shape.rank > 0) {
             // The tighter small-K setting preserves the established path.
-            // CUDA 13.2's batched Jacobi solver needs a slightly looser
+            // cuSOLVER's batched Jacobi solver needs a slightly looser
             // stopping threshold to converge reliably for K=60/100 while
             // still matching the double-precision filter oracle.
             const double jacobi_tolerance =
@@ -1190,6 +1664,74 @@ class GroupFilter::Impl {
         host_solver_info_.resize(groups);
     }
 
+    void enqueue_projected_filter(
+        const GroupBatchShape& shape, const FilterParameters& parameters,
+        const DeviceGroupBatch& batch, const float* centered_noisy,
+        const float* centered_model, const float* centers,
+        const float* selected_eigenvalues, const float* basis, float* scores,
+        cudaStream_t stream) {
+        constexpr float alpha = 1.0F;
+        constexpr float beta = 0.0F;
+        const long long sample_group_stride =
+            static_cast<long long>(shape.retained_stride) * shape.sample_dim;
+        const long long basis_group_stride =
+            static_cast<long long>(shape.rank) * shape.sample_dim;
+        const long long projection_group_stride =
+            static_cast<long long>(shape.retained_stride) * shape.rank;
+
+        check_cublas(
+            cublasSgemmStridedBatched(
+                blas_, CUBLAS_OP_T, CUBLAS_OP_N, shape.rank,
+                shape.retained_stride, shape.sample_dim, &alpha, basis,
+                shape.sample_dim, basis_group_stride, centered_noisy,
+                shape.sample_dim, sample_group_stride, &beta,
+                noisy_projections_.data(), shape.rank,
+                projection_group_stride, shape.groups),
+            "cublasSgemmStridedBatched(noisy projection)");
+
+        const bool needs_model_projection =
+            parameters.stage == Stage::Final &&
+            batch.log_patch_weights != nullptr &&
+            parameters.weight_beta != 0.0F;
+        if (needs_model_projection) {
+            check_cublas(
+                cublasSgemmStridedBatched(
+                    blas_, CUBLAS_OP_T, CUBLAS_OP_N, shape.rank,
+                    shape.retained_stride, shape.sample_dim, &alpha, basis,
+                    shape.sample_dim, basis_group_stride, centered_model,
+                    shape.sample_dim, sample_group_stride, &beta,
+                    model_projections_.data(), shape.rank,
+                    projection_group_stride, shape.groups),
+                "cublasSgemmStridedBatched(model projection)");
+        }
+
+        if (parameters.stage == Stage::Basic) {
+            launch_projected_filter<Stage::Basic>(
+                shape, parameters, batch, centered_model,
+                selected_eigenvalues, equal_flags_.data(),
+                noisy_projections_.data(), nullptr, scores, stream);
+        } else {
+            launch_projected_filter<Stage::Final>(
+                shape, parameters, batch, centered_model,
+                selected_eigenvalues, equal_flags_.data(),
+                noisy_projections_.data(),
+                needs_model_projection ? model_projections_.data() : nullptr,
+                scores, stream);
+        }
+
+        check_cublas(
+            cublasSgemmStridedBatched(
+                blas_, CUBLAS_OP_N, CUBLAS_OP_N, shape.sample_dim,
+                shape.retained_stride, shape.rank, &alpha, basis,
+                shape.sample_dim, basis_group_stride,
+                noisy_projections_.data(), shape.rank,
+                projection_group_stride, &beta, batch.filtered_samples,
+                shape.sample_dim, sample_group_stride, shape.groups),
+            "cublasSgemmStridedBatched(filtered reconstruction)");
+        launch_add_filter_centers(shape, batch, centered_noisy, centers,
+                                  equal_flags_.data(), stream);
+    }
+
     void enqueue(const GroupBatchShape& shape,
                  const FilterParameters& parameters,
                  const DeviceGroupBatch& batch, cudaStream_t stream) {
@@ -1207,10 +1749,18 @@ class GroupFilter::Impl {
         }
 
         check_cuda(cudaSetDevice(device_), "cudaSetDevice");
-        check_cusolver(cusolverDnSetStream(solver_, stream),
-                       "cusolverDnSetStream");
-        if (use_cublas_gram_) {
+        if (shape.rank > 0 &&
+            (!solver_stream_bound_ || solver_stream_ != stream)) {
+            check_cusolver(cusolverDnSetStream(solver_, stream),
+                           "cusolverDnSetStream");
+            solver_stream_ = stream;
+            solver_stream_bound_ = true;
+        }
+        if (shape.rank > 0 && use_cublas_gram_ &&
+            (!blas_stream_bound_ || blas_stream_ != stream)) {
             check_cublas(cublasSetStream(blas_, stream), "cublasSetStream");
+            blas_stream_ = stream;
+            blas_stream_bound_ = true;
         }
         last_groups_ = shape.groups;
         last_stream_ = stream;
@@ -1263,8 +1813,17 @@ class GroupFilter::Impl {
                         decltype(basis_tag)::value;
                     launch_gram<static_basis_count>(
                         shape, centered_model, equal_flags_.data(),
-                        gram_.data(), gram_shared_, stream);
+                        batch.active_groups, gram_.data(), gram_shared_,
+                        stream);
                 });
+            }
+
+            if (use_cublas_gram_ &&
+                (parameters.detect_equal_groups ||
+                 batch.active_groups != nullptr)) {
+                launch_regularize_flagged_gram(
+                    shape, gram_.data(), equal_flags_.data(),
+                    batch.active_groups, stream);
             }
 
             check_cusolver(cusolverDnSsyevjBatched(
@@ -1281,7 +1840,7 @@ class GroupFilter::Impl {
                 launch_map_basis<static_basis_count>(
                     shape, centered_model, gram_.data(),
                     raw_eigenvalues_.data(), equal_flags_.data(),
-                    selected_eigenvalues, basis, stream);
+                    batch.active_groups, selected_eigenvalues, basis, stream);
             });
         } else {
             check_cuda(cudaMemsetAsync(last_solver_info_, 0,
@@ -1291,18 +1850,23 @@ class GroupFilter::Impl {
                        "cudaMemsetAsync(solver info)");
         }
 
-        if (parameters.stage == Stage::Basic) {
+        if (use_cublas_filter_) {
+            enqueue_projected_filter(
+                shape, parameters, batch, centered_noisy_.data(),
+                centered_model, centers_.data(), selected_eigenvalues, basis,
+                scores_.data(), stream);
+        } else if (parameters.stage == Stage::Basic) {
             launch_filter<Stage::Basic>(
                 shape, parameters, batch, centered_noisy_.data(),
                 centered_model, centers_.data(), selected_eigenvalues, basis,
                 equal_flags_.data(), scores_.data(), filter_basic_shared_,
-                stream);
+                filter_basic_scores_, stream);
         } else {
             launch_filter<Stage::Final>(
                 shape, parameters, batch, centered_noisy_.data(),
                 centered_model, centers_.data(), selected_eigenvalues, basis,
                 equal_flags_.data(), scores_.data(), filter_final_shared_,
-                stream);
+                filter_final_scores_, stream);
         }
     }
 
@@ -1338,8 +1902,10 @@ class GroupFilter::Impl {
         return centered_noisy_.bytes() + centered_model_.bytes() +
                model_means_.bytes() + centers_.bytes() + gram_.bytes() +
                raw_eigenvalues_.bytes() + selected_eigenvalues_.bytes() +
-               basis_.bytes() + scores_.bytes() + equal_flags_.bytes() +
-               solver_info_.bytes() + solver_workspace_.bytes();
+               basis_.bytes() + scores_.bytes() +
+               noisy_projections_.bytes() + model_projections_.bytes() +
+               equal_flags_.bytes() + solver_info_.bytes() +
+               solver_workspace_.bytes();
     }
 
     int device_ = 0;
@@ -1354,12 +1920,19 @@ class GroupFilter::Impl {
     int last_groups_ = 0;
     cudaStream_t last_stream_ = nullptr;
     int* last_solver_info_ = nullptr;
+    cudaStream_t solver_stream_ = nullptr;
+    cudaStream_t blas_stream_ = nullptr;
+    bool solver_stream_bound_ = false;
+    bool blas_stream_bound_ = false;
     bool prepare_basic_shared_ = false;
     bool prepare_final_shared_ = false;
     bool gram_shared_ = false;
     bool filter_basic_shared_ = false;
     bool filter_final_shared_ = false;
+    bool filter_basic_scores_ = false;
+    bool filter_final_scores_ = false;
     bool use_cublas_gram_ = false;
+    bool use_cublas_filter_ = false;
 
     DeviceBuffer<float> centered_noisy_;
     DeviceBuffer<float> centered_model_;
@@ -1370,6 +1943,8 @@ class GroupFilter::Impl {
     DeviceBuffer<float> selected_eigenvalues_;
     DeviceBuffer<float> basis_;
     DeviceBuffer<float> scores_;
+    DeviceBuffer<float> noisy_projections_;
+    DeviceBuffer<float> model_projections_;
     DeviceBuffer<float> solver_workspace_;
     DeviceBuffer<int> equal_flags_;
     DeviceBuffer<int> solver_info_;

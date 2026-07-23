@@ -5,6 +5,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 
 namespace vnlbcu {
@@ -88,6 +89,10 @@ struct DeviceAggregationBatch {
     const float* log_patch_weights = nullptr;
     const int* retained_counts = nullptr;
     const PatchMatch* matches = nullptr;
+    // Optional per-group activity mask. Inactive groups are intentionally
+    // omitted from the contribution stack after CPU-compatible paste-mask
+    // suppression, while the upstream matcher/filter may remain batched.
+    const std::uint8_t* active_groups = nullptr;
     int groups = 0;
     DeviceContributionView contributions{};
 };

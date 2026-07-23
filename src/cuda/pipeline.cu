@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -18,7 +19,7 @@ namespace {
 constexpr int block_threads = 256;
 constexpr int warp_width = 32;
 constexpr int warps_per_block = block_threads / warp_width;
-constexpr int max_match_candidates = 2048;
+constexpr int paste_mask_threads = 2 * warp_width;
 
 [[noreturn]] void throw_cuda(cudaError_t status, const char* operation) {
     std::ostringstream message;
@@ -73,26 +74,25 @@ int temporal_count_for(const StagePipelineShape& shape) {
         checked_add_int(shape.search_bwd, shape.search_fwd,
                         "CUDA pipeline temporal span overflows"),
         1, "CUDA pipeline temporal span overflows");
-    const int temporal_origins = checked_add_int(
-        shape.source_frames, 1 - shape.patch_time,
-        "CUDA pipeline temporal origin count overflows");
+    const int temporal_origins =
+        checked_add_int(shape.source_frames, 1 - shape.patch_time,
+                        "CUDA pipeline temporal origin count overflows");
     return std::min(requested, temporal_origins);
 }
 
 int candidate_count_for(const StagePipelineShape& shape) {
-    const int x_origins = checked_add_int(
-        shape.width, 1 - shape.patch_size,
-        "CUDA pipeline horizontal origin count overflows");
-    const int y_origins = checked_add_int(
-        shape.height, 1 - shape.patch_size,
-        "CUDA pipeline vertical origin count overflows");
+    const int x_origins =
+        checked_add_int(shape.width, 1 - shape.patch_size,
+                        "CUDA pipeline horizontal origin count overflows");
+    const int y_origins =
+        checked_add_int(shape.height, 1 - shape.patch_size,
+                        "CUDA pipeline vertical origin count overflows");
     const int window_width = std::min(shape.search_window, x_origins);
     const int window_height = std::min(shape.search_window, y_origins);
     return checked_product_int(
         checked_product_int(window_width, window_height,
                             "CUDA pipeline spatial candidates overflow"),
-        temporal_count_for(shape),
-        "CUDA pipeline candidate count overflows");
+        temporal_count_for(shape), "CUDA pipeline candidate count overflows");
 }
 
 int cached_frames_for(const StagePipelineShape& shape) {
@@ -137,10 +137,6 @@ void validate_shape(const StagePipelineShape& shape) {
     }
 
     const int candidates = candidate_count_for(shape);
-    if (candidates > max_match_candidates) {
-        throw std::invalid_argument(
-            "CUDA pipeline matcher supports at most 2048 candidates");
-    }
     const int effective_similar = std::min(shape.requested_similar, candidates);
     if (shape.basis_similar != effective_similar) {
         throw std::invalid_argument(
@@ -225,10 +221,11 @@ template <typename T> class DeviceBuffer {
             return;
         }
         T* replacement = nullptr;
-        check_cuda(cudaMalloc(reinterpret_cast<void**>(&replacement),
-                              checked_product(count, sizeof(T),
-                                              "CUDA pipeline buffer overflows")),
-                   "cudaMalloc(CUDA pipeline buffer)");
+        check_cuda(
+            cudaMalloc(reinterpret_cast<void**>(&replacement),
+                       checked_product(count, sizeof(T),
+                                       "CUDA pipeline buffer overflows")),
+            "cudaMalloc(CUDA pipeline buffer)");
         if (data_ != nullptr) {
             check_cuda(cudaFree(data_), "cudaFree(CUDA pipeline buffer)");
         }
@@ -263,14 +260,75 @@ __global__ void set_anchor_frame_kernel(PatchOrigin* anchors, int groups,
     }
 }
 
+// CPU paste-mask decisions are data-dependent and must observe groups in
+// row-major anchor order. One CTA supplies that ordering, while its threads
+// clear the retained matches of each accepted group in parallel.
+__global__ void
+apply_paste_mask_kernel(const PatchOrigin* __restrict__ anchors,
+                        const int* __restrict__ retained_counts,
+                        const PatchMatch* __restrict__ matches, int groups,
+                        int retained_stride, int anchor_frame, int origin_width,
+                        int origin_height, int patch_size,
+                        std::uint8_t* __restrict__ paste_mask,
+                        std::uint8_t* __restrict__ active_groups) {
+    const int thread = static_cast<int>(threadIdx.x);
+    __shared__ int group_active;
+
+    for (int group = 0; group < groups; ++group) {
+        if (thread == 0) {
+            const PatchOrigin anchor = anchors[group];
+            const bool valid = anchor.x >= 0 && anchor.x < origin_width &&
+                               anchor.y >= 0 && anchor.y < origin_height;
+            group_active =
+                valid ? paste_mask[anchor.y * origin_width + anchor.x] : 0;
+            active_groups[group] = static_cast<std::uint8_t>(group_active != 0);
+        }
+        __syncthreads();
+
+        if (group_active != 0) {
+            const int similar =
+                max(0, min(retained_counts[group], retained_stride));
+            const std::size_t descriptor_base =
+                static_cast<std::size_t>(group) * retained_stride;
+            for (int sample = thread; sample < similar;
+                 sample += static_cast<int>(blockDim.x)) {
+                const PatchMatch match = matches[descriptor_base + sample];
+                if (match.frame != anchor_frame || match.x < 0 ||
+                    match.x >= origin_width || match.y < 0 ||
+                    match.y >= origin_height) {
+                    continue;
+                }
+
+                paste_mask[match.y * origin_width + match.x] = 0U;
+                if (match.y > 2 * patch_size) {
+                    paste_mask[(match.y - 1) * origin_width + match.x] = 0U;
+                }
+                const int source_height = origin_height + patch_size - 1;
+                if (match.y < source_height - (2 * patch_size)) {
+                    paste_mask[(match.y + 1) * origin_width + match.x] = 0U;
+                }
+                if (match.x > 2 * patch_size) {
+                    paste_mask[match.y * origin_width + match.x - 1] = 0U;
+                }
+                const int source_width = origin_width + patch_size - 1;
+                if (match.x < source_width - (2 * patch_size)) {
+                    paste_mask[match.y * origin_width + match.x + 1] = 0U;
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
 // The flat-area test is intentionally separated from GroupFilter.  It is
 // optional, reads the gathered group once, and leaves the common Basic/Final
 // PCA kernels free of a branch and an unconditional variance pass.
-__global__ void flat_flags_kernel(const float* __restrict__ noisy_samples,
-                                  const int* __restrict__ retained_counts,
-                                  int groups, int retained_stride,
-                                  int channels, int patch_dim, float threshold,
-                                  std::uint8_t* __restrict__ flat_flags) {
+__global__ void
+flat_flags_kernel(const float* __restrict__ noisy_samples,
+                  const int* __restrict__ retained_counts,
+                  const std::uint8_t* __restrict__ active_groups, int groups,
+                  int retained_stride, int channels, int patch_dim,
+                  float threshold, std::uint8_t* __restrict__ flat_flags) {
     __shared__ float warp_sums[warps_per_block];
     __shared__ float warp_squares[warps_per_block];
     __shared__ float variance_sum;
@@ -280,6 +338,12 @@ __global__ void flat_flags_kernel(const float* __restrict__ noisy_samples,
     const int lane = thread & (warp_width - 1);
     const int warp = thread / warp_width;
     if (group >= groups) {
+        return;
+    }
+    if (active_groups != nullptr && active_groups[group] == 0U) {
+        if (thread == 0) {
+            flat_flags[group] = 0U;
+        }
         return;
     }
     if (thread == 0) {
@@ -303,10 +367,11 @@ __global__ void flat_flags_kernel(const float* __restrict__ noisy_samples,
         for (int position = thread; position < patch_dim;
              position += block_threads) {
             for (int sample = 0; sample < similar; ++sample) {
-                const float value = noisy_samples[
-                    group_base +
-                    static_cast<std::size_t>(sample) * sample_dim +
-                    channel_base + position];
+                const float value =
+                    noisy_samples[group_base +
+                                  static_cast<std::size_t>(sample) *
+                                      sample_dim +
+                                  channel_base + position];
                 local_sum += value;
                 local_square = fmaf(value, value, local_square);
             }
@@ -329,8 +394,8 @@ __global__ void flat_flags_kernel(const float* __restrict__ noisy_samples,
             if (lane == 0) {
                 const float numerator =
                     fmaxf(total_square - (total_sum * total_sum / count), 0.0F);
-                variance_sum += count > 1.0F ? numerator / (count - 1.0F)
-                                             : 0.0F;
+                variance_sum +=
+                    count > 1.0F ? numerator / (count - 1.0F) : 0.0F;
             }
         }
         __syncthreads();
@@ -405,34 +470,32 @@ class StagePipeline::Impl {
     void reserve(const StagePipelineShape& shape, float window_gamma) {
         validate_shape(shape);
         if (!std::isfinite(window_gamma) || window_gamma < 0.0F) {
-            throw std::invalid_argument(
-                "CUDA aggregation window gamma must be finite and non-negative");
+            throw std::invalid_argument("CUDA aggregation window gamma must be "
+                                        "finite and non-negative");
         }
-        check_cuda(cudaSetDevice(device_), "cudaSetDevice(CUDA pipeline)");
         if (reserved_ && same_shape(shape, shape_) &&
             window_gamma == window_gamma_) {
             return;
         }
-
         const int sample_dim = sample_dim_for(shape);
-        const std::size_t descriptors = checked_product(
-            static_cast<std::size_t>(shape.max_groups),
-            static_cast<std::size_t>(shape.retained_stride),
-            "CUDA pipeline descriptor count overflows");
-        const std::size_t samples = checked_product(
-            descriptors, static_cast<std::size_t>(sample_dim),
-            "CUDA pipeline sample count overflows");
+        const std::size_t descriptors =
+            checked_product(static_cast<std::size_t>(shape.max_groups),
+                            static_cast<std::size_t>(shape.retained_stride),
+                            "CUDA pipeline descriptor count overflows");
+        const std::size_t samples =
+            checked_product(descriptors, static_cast<std::size_t>(sample_dim),
+                            "CUDA pipeline sample count overflows");
 
-        MatchBatchShape match_shape = make_match_shape(
-            shape, shape.max_groups,
-            DeviceVideoView{
-                .width = shape.width,
-                .height = shape.height,
-                .channels = shape.channels,
-                .frames = cached_frames_for(shape),
-                .first_frame = 0,
-                .source_frames = shape.source_frames,
-            });
+        MatchBatchShape match_shape =
+            make_match_shape(shape, shape.max_groups,
+                             DeviceVideoView{
+                                 .width = shape.width,
+                                 .height = shape.height,
+                                 .channels = shape.channels,
+                                 .frames = cached_frames_for(shape),
+                                 .first_frame = 0,
+                                 .source_frames = shape.source_frames,
+                             });
         matcher_.reserve(match_shape);
         filter_.reserve(make_group_shape(shape, shape.max_groups));
         aggregator_.reserve(make_aggregation_shape(shape), window_gamma);
@@ -445,6 +508,12 @@ class StagePipeline::Impl {
             flat_flags_.reserve(static_cast<std::size_t>(shape.max_groups));
         }
         log_patch_weights_.reserve(descriptors);
+        const std::size_t origins = checked_product(
+            static_cast<std::size_t>(shape.width - shape.patch_size + 1),
+            static_cast<std::size_t>(shape.height - shape.patch_size + 1),
+            "CUDA pipeline paste-mask size overflows");
+        paste_mask_.reserve(origins);
+        active_groups_.reserve(static_cast<std::size_t>(shape.max_groups));
 
         shape_ = shape;
         window_gamma_ = window_gamma;
@@ -452,13 +521,15 @@ class StagePipeline::Impl {
     }
 
     void clear_contributions(float* numerators, float* weights,
-                             cudaStream_t stream) const {
+                             cudaStream_t stream) {
         require_reserved();
-        check_cuda(cudaSetDevice(device_), "cudaSetDevice(CUDA pipeline)");
-        aggregator_.enqueue_clear(make_contiguous_contribution_view(
-                                      make_aggregation_shape(shape_), numerators,
-                                      weights),
-                                  stream);
+        aggregator_.enqueue_clear(
+            make_contiguous_contribution_view(make_aggregation_shape(shape_),
+                                              numerators, weights),
+            stream);
+        check_cuda(
+            cudaMemsetAsync(paste_mask_.data(), 1, paste_mask_.bytes(), stream),
+            "cudaMemsetAsync(CUDA pipeline paste mask)");
     }
 
     void set_anchor_frame(PatchOrigin* anchors, int groups, int frame,
@@ -506,10 +577,12 @@ class StagePipeline::Impl {
             throw std::invalid_argument(
                 "CUDA pipeline anchor frame is not a valid patch origin");
         }
-        check_cuda(cudaSetDevice(device_), "cudaSetDevice(CUDA pipeline)");
 
         const MatchBatchShape match_shape =
             make_match_shape(shape, batch.groups, batch.noisy);
+        const int origin_width = shape.width - shape.patch_size + 1;
+        const int origin_height = shape.height - shape.patch_size + 1;
+
         const DeviceMatchBatch match_batch{
             .noisy = batch.noisy,
             .basic = batch.basic,
@@ -524,6 +597,18 @@ class StagePipeline::Impl {
         };
         matcher_.enqueue(match_shape, parameters.match, match_batch, stream);
 
+        const std::uint8_t* active_groups = nullptr;
+        if (parameters.paste_mask) {
+            apply_paste_mask_kernel<<<1, paste_mask_threads, 0, stream>>>(
+                batch.anchors, retained_counts_.data(), matches_.data(),
+                batch.groups, shape.retained_stride, batch.anchor_frame,
+                origin_width, origin_height, shape.patch_size,
+                paste_mask_.data(), active_groups_.data());
+            check_cuda(cudaPeekAtLastError(),
+                       "launch CUDA ordered paste-mask kernel");
+            active_groups = active_groups_.data();
+        }
+
         const std::uint8_t* flat_flags = nullptr;
         if (parameters.flat_areas) {
             const float threshold = parameters.filter.sigma *
@@ -531,9 +616,9 @@ class StagePipeline::Impl {
                                     parameters.flat_gamma;
             flat_flags_kernel<<<static_cast<unsigned int>(batch.groups),
                                 block_threads, 0, stream>>>(
-                noisy_samples_.data(), retained_counts_.data(), batch.groups,
-                shape.retained_stride, shape.channels, patch_dim_for(shape),
-                threshold, flat_flags_.data());
+                noisy_samples_.data(), retained_counts_.data(), active_groups,
+                batch.groups, shape.retained_stride, shape.channels,
+                patch_dim_for(shape), threshold, flat_flags_.data());
             check_cuda(cudaPeekAtLastError(),
                        "launch CUDA flat-area detection kernel");
             flat_flags = flat_flags_.data();
@@ -546,6 +631,7 @@ class StagePipeline::Impl {
             .basic_samples =
                 shape.stage == Stage::Final ? basic_samples_.data() : nullptr,
             .retained_counts = retained_counts_.data(),
+            .active_groups = active_groups,
             .flat_flags = flat_flags,
             // GroupFilter has completed every read of noisy_samples before its
             // final kernel writes estimates, so in-place output removes one
@@ -560,34 +646,33 @@ class StagePipeline::Impl {
 
         const AggregationShape aggregation_shape =
             make_aggregation_shape(shape);
-        aggregator_.enqueue_scatter(
-            aggregation_shape,
-            AggregationParameters{
-                .anchor_frame = batch.anchor_frame,
-                .log_weight_model_count = 1,
-                .log_weight_model_stride = 0,
-            },
-            DeviceAggregationBatch{
-                .filtered_samples = noisy_samples_.data(),
-                .log_patch_weights = log_patch_weights_.data(),
-                .retained_counts = retained_counts_.data(),
-                .matches = matches_.data(),
-                .groups = batch.groups,
-                .contributions = make_contiguous_contribution_view(
-                    aggregation_shape, batch.contribution_numerators,
-                    batch.contribution_weights),
-            },
-            stream);
+        const AggregationParameters aggregation_parameters{
+            .anchor_frame = batch.anchor_frame,
+            .log_weight_model_count = 1,
+            .log_weight_model_stride = 0,
+        };
+        const DeviceAggregationBatch aggregation_batch{
+            .filtered_samples = noisy_samples_.data(),
+            .log_patch_weights = log_patch_weights_.data(),
+            .retained_counts = retained_counts_.data(),
+            .matches = matches_.data(),
+            .active_groups = active_groups,
+            .groups = batch.groups,
+            .contributions = make_contiguous_contribution_view(
+                aggregation_shape, batch.contribution_numerators,
+                batch.contribution_weights),
+        };
+        aggregator_.enqueue_scatter(aggregation_shape, aggregation_parameters,
+                                    aggregation_batch, stream);
     }
 
     void pack_contributions(float* numerators, float* weights, float* packed,
                             cudaStream_t stream) const {
         require_reserved();
-        check_cuda(cudaSetDevice(device_), "cudaSetDevice(CUDA pipeline)");
-        aggregator_.enqueue_pack(make_contiguous_contribution_view(
-                                     make_aggregation_shape(shape_),
-                                     numerators, weights),
-                                 packed, stream);
+        aggregator_.enqueue_pack(
+            make_contiguous_contribution_view(make_aggregation_shape(shape_),
+                                              numerators, weights),
+            packed, stream);
     }
 
     void normalize_contributions(float* numerators, float* weights, int slot,
@@ -596,7 +681,6 @@ class StagePipeline::Impl {
                                  DeviceMutableFrameView output,
                                  cudaStream_t stream) const {
         require_reserved();
-        check_cuda(cudaSetDevice(device_), "cudaSetDevice(CUDA pipeline)");
         aggregator_.enqueue_normalize(
             make_contiguous_contribution_view(make_aggregation_shape(shape_),
                                               numerators, weights),
@@ -607,6 +691,7 @@ class StagePipeline::Impl {
         return retained_counts_.bytes() + matches_.bytes() +
                noisy_samples_.bytes() + basic_samples_.bytes() +
                flat_flags_.bytes() + log_patch_weights_.bytes() +
+               paste_mask_.bytes() + active_groups_.bytes() +
                matcher_.workspace_bytes() + filter_.workspace_bytes() +
                aggregator_.workspace_bytes();
     }
@@ -630,6 +715,8 @@ class StagePipeline::Impl {
     DeviceBuffer<float> basic_samples_;
     DeviceBuffer<std::uint8_t> flat_flags_;
     DeviceBuffer<float> log_patch_weights_;
+    DeviceBuffer<std::uint8_t> paste_mask_;
+    DeviceBuffer<std::uint8_t> active_groups_;
 };
 
 StagePipeline::StagePipeline(int device)
@@ -650,7 +737,7 @@ void StagePipeline::reserve(const StagePipelineShape& shape,
 }
 
 void StagePipeline::clear_contributions(float* numerators, float* weights,
-                                        cudaStream_t stream) const {
+                                        cudaStream_t stream) {
     if (impl_ == nullptr) {
         throw std::logic_error("CUDA StagePipeline was moved from");
     }
@@ -684,10 +771,12 @@ void StagePipeline::pack_contributions(float* numerators, float* weights,
     impl_->pack_contributions(numerators, weights, packed, stream);
 }
 
-void StagePipeline::normalize_contributions(
-    float* numerators, float* weights, int slot,
-    DeviceVideoView fallback_source, int source_frame,
-    DeviceMutableFrameView output, cudaStream_t stream) const {
+void StagePipeline::normalize_contributions(float* numerators, float* weights,
+                                            int slot,
+                                            DeviceVideoView fallback_source,
+                                            int source_frame,
+                                            DeviceMutableFrameView output,
+                                            cudaStream_t stream) const {
     if (impl_ == nullptr) {
         throw std::logic_error("CUDA StagePipeline was moved from");
     }

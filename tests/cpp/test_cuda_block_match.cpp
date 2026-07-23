@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -105,8 +106,10 @@ struct HostResult {
 int origin_count(int axis, int patch) { return axis - patch + 1; }
 
 int temporal_count(const vnlbcu::MatchBatchShape& shape) {
-    return std::min(shape.search_bwd + shape.search_fwd + 1,
-                    origin_count(shape.source_frames, shape.patch_time));
+    const long long requested = static_cast<long long>(shape.search_bwd) +
+                                shape.search_fwd + 1;
+    return static_cast<int>(std::min<long long>(
+        requested, origin_count(shape.source_frames, shape.patch_time)));
 }
 
 int window_width(const vnlbcu::MatchBatchShape& shape) {
@@ -120,10 +123,12 @@ int window_height(const vnlbcu::MatchBatchShape& shape) {
 }
 
 int shifted_low(int center, int half, int max_origin) {
-    const int start = center - half;
-    const int end = center + half;
-    const int shift = std::min(0, start) + std::max(0, end - max_origin);
-    return std::max(0, start - shift);
+    const long long start = static_cast<long long>(center) - half;
+    const long long end = static_cast<long long>(center) + half;
+    const long long shift =
+        std::min(0LL, start) + std::max(0LL, end - max_origin);
+    return static_cast<int>(
+        std::clamp(start - shift, 0LL, static_cast<long long>(max_origin)));
 }
 
 int scheduled_frame(const vnlbcu::MatchBatchShape& shape, int anchor,
@@ -132,12 +137,20 @@ int scheduled_frame(const vnlbcu::MatchBatchShape& shape, int anchor,
         return anchor;
     }
     const int max_origin = shape.source_frames - shape.patch_time;
-    const int start = anchor - shape.search_bwd;
-    const int end = anchor + shape.search_fwd;
-    const int shift = std::min(0, start) + std::max(0, end - max_origin);
-    const int high = std::min(max_origin, end - shift);
-    const int forward = high - anchor;
-    return slot <= forward ? anchor + slot : anchor - (slot - forward);
+    const long long start =
+        static_cast<long long>(anchor) - shape.search_bwd;
+    const long long end =
+        static_cast<long long>(anchor) + shape.search_fwd;
+    const long long shift =
+        std::min(0LL, start) + std::max(0LL, end - max_origin);
+    const long long high = std::min<long long>(max_origin, end - shift);
+    const long long low = std::max(0LL, start - shift);
+    const long long forward = high - anchor;
+    const long long frame = slot <= forward
+                                ? static_cast<long long>(anchor) + slot
+                                : static_cast<long long>(anchor) -
+                                      (slot - forward);
+    return static_cast<int>(std::clamp(frame, low, high));
 }
 
 HostWindow make_window(const vnlbcu::MatchBatchShape& shape,
@@ -360,9 +373,12 @@ struct CaseGeometry {
     bool pointer_table = false;
 };
 
-void run_case(vnlbcu::Stage stage, int requested_similar, bool use_centers,
-              bool expand_to_cap, int retained_stride = 0,
-              int reserved_groups = 2, CaseGeometry geometry = {}) {
+void run_case(
+    vnlbcu::Stage stage, int requested_similar, bool use_centers,
+    bool expand_to_cap, int retained_stride = 0, int reserved_groups = 2,
+    CaseGeometry geometry = {},
+    vnlbcu::MatchStrategy strategy = vnlbcu::MatchStrategy::Auto,
+    vnlbcu::MatchStrategy expected_strategy = vnlbcu::MatchStrategy::Fused) {
     const vnlbcu::MatchBatchShape shape{
         .stage = stage,
         .groups = 2,
@@ -382,6 +398,7 @@ void run_case(vnlbcu::Stage stage, int requested_similar, bool use_centers,
             retained_stride > 0
                 ? retained_stride
                 : (requested_similar == 1 ? 1 : requested_similar + 4),
+        .strategy = strategy,
     };
     const std::size_t video_values = static_cast<std::size_t>(shape.frames) *
                                      shape.channels * shape.height *
@@ -591,6 +608,9 @@ void run_case(vnlbcu::Stage stage, int requested_similar, bool use_centers,
     reserved_shape.first_frame = 0;
     reserved_shape.frames = shape.first_frame + shape.frames;
     matcher.reserve(reserved_shape);
+    if (matcher.strategy() != expected_strategy) {
+        throw std::runtime_error("CUDA matcher strategy query mismatch");
+    }
     if (matcher.temporal_count() != temporal_count(shape) ||
         matcher.candidate_count() != temporal_count(shape) *
                                          window_width(shape) *
@@ -722,15 +742,214 @@ int main() {
                               .search_bwd = 149,
                               .search_fwd = 150,
                               .anchor_frame = 149});
-        // Exact 2048-candidate limit: exercises ItemsPerThread==8, the static
-        // P=8 gather path, and enqueueing a smaller final chunk than reserve.
+        // A legal but extremely asymmetric radius must be clamped before any
+        // device-side addition, so anchor+search_fwd cannot wrap around.
+        run_case(vnlbcu::Stage::Basic, 3, false, true, 5, 2,
+                 CaseGeometry{
+                     .width = 3,
+                     .height = 3,
+                     .channels = 1,
+                     .frames = 5,
+                     .first_frame = 0,
+                     .source_frames = 5,
+                     .patch_size = 3,
+                     .patch_time = 1,
+                     .search_window = 1,
+                     .search_bwd = 0,
+                     .search_fwd = std::numeric_limits<int>::max() - 1,
+                     .anchor_frame = 2,
+                     .second_anchor_frame = 4,
+                 });
+        // All three selectors must agree at 2048 candidates.  This also
+        // exercises ItemsPerThread==8, the static P=8
+        // gather path, and enqueueing a smaller final chunk than reserve.
         run_case(vnlbcu::Stage::Basic, 17, false, true, 0, 3,
                  CaseGeometry{.width = 39,
                               .height = 39,
                               .patch_size = 8,
                               .search_window = 33,
                               .search_bwd = 0,
-                              .search_fwd = 1});
+                              .search_fwd = 1},
+                 vnlbcu::MatchStrategy::Fused, vnlbcu::MatchStrategy::Fused);
+        run_case(vnlbcu::Stage::Basic, 17, false, true, 0, 3,
+                 CaseGeometry{.width = 39,
+                              .height = 39,
+                              .patch_size = 8,
+                              .search_window = 33,
+                              .search_bwd = 0,
+                              .search_fwd = 1},
+                 vnlbcu::MatchStrategy::Chunked,
+                 vnlbcu::MatchStrategy::Chunked);
+        run_case(vnlbcu::Stage::Basic, 17, false, true, 0, 3,
+                 CaseGeometry{.width = 39,
+                              .height = 39,
+                              .patch_size = 8,
+                              .search_window = 33,
+                              .search_bwd = 0,
+                              .search_fwd = 1},
+                 vnlbcu::MatchStrategy::FullSort,
+                 vnlbcu::MatchStrategy::FullSort);
+
+        // The default 27x27x3 search has N=2187 candidates.  Constant input
+        // makes every distance tie, so these cases also verify that the newly
+        // admitted 9-item fused selector and both fallback selectors preserve
+        // the same candidate scan order.
+        const CaseGeometry default_search_geometry{
+            .width = 27,
+            .height = 27,
+            .channels = 1,
+            .frames = 3,
+            .first_frame = 0,
+            .source_frames = 3,
+            .patch_size = 1,
+            .patch_time = 1,
+            .search_window = 27,
+            .search_bwd = 1,
+            .search_fwd = 1,
+            .anchor_frame = 1,
+            .constant_video = true,
+        };
+        run_case(vnlbcu::Stage::Basic, 17, false, true, 68, 2,
+                 default_search_geometry, vnlbcu::MatchStrategy::Auto,
+                 vnlbcu::MatchStrategy::Fused);
+        run_case(vnlbcu::Stage::Basic, 17, false, true, 68, 2,
+                 default_search_geometry, vnlbcu::MatchStrategy::Chunked,
+                 vnlbcu::MatchStrategy::Chunked);
+        run_case(vnlbcu::Stage::Basic, 17, false, true, 68, 2,
+                 default_search_geometry, vnlbcu::MatchStrategy::FullSort,
+                 vnlbcu::MatchStrategy::FullSort);
+
+        // A non-power-of-two candidate count splits the spatial window into
+        // unequal tiles.  Equal distances verify stable scan-order selection
+        // across the tile boundary.
+        run_case(vnlbcu::Stage::Basic, 17, false, true, 68, 2,
+                 CaseGeometry{.width = 47,
+                              .height = 47,
+                              .channels = 1,
+                              .frames = 1,
+                              .first_frame = 0,
+                              .source_frames = 1,
+                              .patch_size = 1,
+                              .patch_time = 1,
+                              .search_window = 47,
+                              .search_bwd = 0,
+                              .search_fwd = 0,
+                              .anchor_frame = 0,
+                              .constant_video = true},
+                 vnlbcu::MatchStrategy::Chunked,
+                 vnlbcu::MatchStrategy::Chunked);
+
+        // Crossover guards for Auto: 29x29 tiles still favor the
+        // segmented sort, while 31x31 tiles amortize the local radix sort.
+        run_case(vnlbcu::Stage::Basic, 17, false, true, 68, 2,
+                 CaseGeometry{.width = 29,
+                              .height = 29,
+                              .channels = 1,
+                              .frames = 4,
+                              .first_frame = 0,
+                              .source_frames = 4,
+                              .patch_size = 1,
+                              .patch_time = 1,
+                              .search_window = 29,
+                              .search_bwd = 1,
+                              .search_fwd = 2,
+                              .anchor_frame = 1,
+                              .second_anchor_frame = 3},
+                 vnlbcu::MatchStrategy::Auto,
+                 vnlbcu::MatchStrategy::FullSort);
+        run_case(vnlbcu::Stage::Basic, 17, false, true, 68, 2,
+                 CaseGeometry{.width = 31,
+                              .height = 31,
+                              .channels = 1,
+                              .frames = 4,
+                              .first_frame = 0,
+                              .source_frames = 4,
+                              .patch_size = 1,
+                              .patch_time = 1,
+                              .search_window = 31,
+                              .search_bwd = 1,
+                              .search_fwd = 2,
+                              .anchor_frame = 1,
+                              .second_anchor_frame = 3},
+                 vnlbcu::MatchStrategy::Auto,
+                 vnlbcu::MatchStrategy::Chunked);
+
+        // Large tiles remain profitable beyond ten tasks; partial-count
+        // feasibility, rather than a hard task limit, bounds this path.
+        run_case(vnlbcu::Stage::Basic, 17, false, true, 68, 2,
+                 CaseGeometry{.width = 33,
+                              .height = 33,
+                              .channels = 1,
+                              .frames = 11,
+                              .first_frame = 0,
+                              .source_frames = 11,
+                              .patch_size = 1,
+                              .patch_time = 1,
+                              .search_window = 33,
+                              .search_bwd = 5,
+                              .search_fwd = 5,
+                              .anchor_frame = 5},
+                 vnlbcu::MatchStrategy::Auto,
+                 vnlbcu::MatchStrategy::Chunked);
+
+        // Paper-scale N=8192: the default-like K/C geometry automatically
+        // sends four local tiles into the maximum-size bounded merge.
+        run_case(vnlbcu::Stage::Basic, 128, false, true, 512, 2,
+                 CaseGeometry{.width = 64,
+                              .height = 64,
+                              .channels = 1,
+                              .frames = 2,
+                              .first_frame = 0,
+                              .source_frames = 2,
+                              .patch_size = 1,
+                              .patch_time = 1,
+                              .search_window = 65,
+                              .search_bwd = 0,
+                              .search_fwd = 1,
+                              .anchor_frame = 0},
+                 vnlbcu::MatchStrategy::Auto,
+                 vnlbcu::MatchStrategy::Chunked);
+
+        // Full-sort must also support retaining every paper-scale candidate,
+        // rather than only the usual small cap.
+        run_case(vnlbcu::Stage::Basic, 17, false, true, 8192, 2,
+                 CaseGeometry{.width = 64,
+                              .height = 64,
+                              .channels = 1,
+                              .frames = 2,
+                              .first_frame = 0,
+                              .source_frames = 2,
+                              .patch_size = 1,
+                              .patch_time = 1,
+                              .search_window = 65,
+                              .search_bwd = 0,
+                              .search_fwd = 1,
+                              .anchor_frame = 0},
+                 vnlbcu::MatchStrategy::FullSort,
+                 vnlbcu::MatchStrategy::FullSort);
+
+        // N=9477 must automatically select the general full-sort fallback;
+        // this also covers Final matching, motion centers, pointer tables, and
+        // padded frame storage.
+        run_case(vnlbcu::Stage::Final, 60, true, true, 240, 2,
+                 CaseGeometry{.width = 27,
+                              .height = 27,
+                              .channels = 3,
+                              .frames = 13,
+                              .first_frame = 0,
+                              .source_frames = 13,
+                              .patch_size = 1,
+                              .patch_time = 1,
+                              .search_window = 27,
+                              .search_bwd = 6,
+                              .search_fwd = 6,
+                              .anchor_frame = 6,
+                              .row_padding = 2,
+                              .channel_padding = 3,
+                              .frame_padding = 5,
+                              .pointer_table = true},
+                 vnlbcu::MatchStrategy::Auto,
+                 vnlbcu::MatchStrategy::FullSort);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return EXIT_FAILURE;

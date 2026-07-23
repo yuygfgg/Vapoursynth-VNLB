@@ -211,8 +211,8 @@ vnlbcu::StagePipelineShape make_shape(vnlbcu::Stage stage, int channels) {
     };
 }
 
-vnlbcu::StagePipelineParameters make_parameters(vnlbcu::Stage stage,
-                                                bool flat_areas) {
+vnlbcu::StagePipelineParameters
+make_parameters(vnlbcu::Stage stage, bool flat_areas, bool paste_mask = false) {
     return vnlbcu::StagePipelineParameters{
         .match = vnlbcu::MatchParameters{.tau = 0.0F},
         .filter =
@@ -230,11 +230,12 @@ vnlbcu::StagePipelineParameters make_parameters(vnlbcu::Stage stage,
             },
         .flat_areas = flat_areas,
         .flat_gamma = 0.95F,
+        .paste_mask = paste_mask,
     };
 }
 
 void run_pipeline_case(vnlbcu::Stage stage, int channels, bool flat_areas,
-                       bool pointer_table = false) {
+                       bool pointer_table = false, bool paste_mask = false) {
     const std::size_t video_values =
         static_cast<std::size_t>(channels) * width * height;
     std::vector<float> noisy(video_values);
@@ -259,15 +260,18 @@ void run_pipeline_case(vnlbcu::Stage stage, int channels, bool flat_areas,
     const std::vector<vnlbcu::PatchOrigin> anchors{
         vnlbcu::PatchOrigin{.x = 0, .y = 0, .frame = 0},
         vnlbcu::PatchOrigin{.x = 1, .y = 0, .frame = 0},
-        vnlbcu::PatchOrigin{.x = 0, .y = 1, .frame = 0},
+        paste_mask ? vnlbcu::PatchOrigin{.x = 0, .y = 0, .frame = 0}
+                   : vnlbcu::PatchOrigin{.x = 0, .y = 1, .frame = 0},
     };
+    const std::span<const vnlbcu::PatchOrigin> expected_anchors(
+        anchors.data(), anchors.size() - (paste_mask ? 1U : 0U));
     const std::span<const float> filtered_reference =
         stage == vnlbcu::Stage::Final && flat_areas
             ? std::span<const float>(basic)
             : std::span<const float>(noisy);
-    const ExpectedResult expected = make_reference(
-        channels, std::span<const float>(noisy), filtered_reference,
-        std::span<const vnlbcu::PatchOrigin>(anchors));
+    const ExpectedResult expected =
+        make_reference(channels, std::span<const float>(noisy),
+                       filtered_reference, expected_anchors);
 
     Stream stream;
     DeviceArray<float> device_noisy(video_values);
@@ -289,7 +293,7 @@ void run_pipeline_case(vnlbcu::Stage stage, int channels, bool flat_areas,
 
     const vnlbcu::StagePipelineShape shape = make_shape(stage, channels);
     const vnlbcu::StagePipelineParameters parameters =
-        make_parameters(stage, flat_areas);
+        make_parameters(stage, flat_areas, paste_mask);
     vnlbcu::StagePipeline pipeline;
     // gamma=0 gives a rectangular window, making the hand-written reference
     // exact while still exercising the device window upload and scatter path.
@@ -419,14 +423,13 @@ void test_explicit_fast_path_constraints() {
     shape = make_shape(vnlbcu::Stage::Basic, 1);
     shape.width = 50;
     shape.height = 50;
-    shape.search_window = 47; // 2209 candidates, above the fused limit.
-    rejected = false;
-    try {
-        pipeline.reserve(shape, 0.0F);
-    } catch (const std::invalid_argument&) {
-        rejected = true;
-    }
-    require(rejected, "oversized matcher candidate set was not rejected");
+    shape.search_window = 47; // 2209 candidates, above the fused capacity.
+    shape.requested_similar = 2;
+    shape.retained_stride = 2;
+    shape.basis_similar = 2;
+    pipeline.reserve(shape, 0.0F);
+    require(pipeline.workspace_bytes() > 0,
+            "fallback matcher pipeline did not allocate workspace");
 }
 
 void test_device_anchor_frame_update() {
@@ -474,6 +477,9 @@ int main() {
         // Two coupled channels make flat detection average channel variances,
         // and pack must duplicate the shared weight plane for both channels.
         run_pipeline_case(vnlbcu::Stage::Final, 2, true, true);
+        // The duplicate tail is submitted in a second chunk. Ordered paste
+        // suppression must carry its mask state across chunk-local buffers.
+        run_pipeline_case(vnlbcu::Stage::Basic, 1, false, false, true);
         test_explicit_fast_path_constraints();
         test_device_anchor_frame_update();
     } catch (const std::exception& error) {

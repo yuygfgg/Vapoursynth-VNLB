@@ -15,7 +15,7 @@ namespace vnlbcu {
 // largest chunk submitted at once; a complete frame may contain any number of
 // chunks.  The model count B is deliberately fixed per worker while the
 // retained count S remains per-group and is read from retained_counts.  The
-// fused matcher currently accepts at most 2048 candidates per anchor.
+// matcher selects a fused, chunked, or full-sort implementation per geometry.
 struct StagePipelineShape {
     Stage stage = Stage::Basic;
     int max_groups = 0;
@@ -47,6 +47,10 @@ struct StagePipelineParameters {
     // group before PCA.  It is skipped entirely when flat_areas is false.
     bool flat_areas = false;
     float flat_gamma = 0.95F;
+    // Reproduce the CPU's ordered paste-mask suppression between matching and
+    // aggregation. Matching and PCA remain batched; inactive groups simply do
+    // not contribute to the output.
+    bool paste_mask = false;
 };
 
 // All pointers are device pointers.  The video window and anchor array may
@@ -57,8 +61,8 @@ struct DeviceStageBatch {
     DeviceVideoView noisy{};
     DeviceVideoView basic{};
     // Every anchor in this chunk must use anchor_frame as its temporal origin.
-    const PatchOrigin* anchors = nullptr;          // [groups]
-    const SearchCenter* search_centers = nullptr;  // optional [groups][T]
+    const PatchOrigin* anchors = nullptr;         // [groups]
+    const SearchCenter* search_centers = nullptr; // optional [groups][T]
     int groups = 0;
     int anchor_frame = 0;
 
@@ -89,9 +93,10 @@ class StagePipeline final {
     // window.  No allocation occurs in clear/enqueue/pack after reserve.
     void reserve(const StagePipelineShape& shape, float window_gamma);
 
-    // Clears a complete anchor-frame contribution stack asynchronously.
+    // Clears a complete anchor-frame contribution stack and resets the
+    // optional ordered paste mask asynchronously.
     void clear_contributions(float* numerators, float* weights,
-                             cudaStream_t stream = nullptr) const;
+                             cudaStream_t stream = nullptr);
 
     // Updates only the temporal coordinate of a device-resident spatial
     // anchor grid.  A scheduler can upload x/y once during worker creation
@@ -104,8 +109,7 @@ class StagePipeline final {
     // synchronization.
     void enqueue(const StagePipelineShape& shape,
                  const StagePipelineParameters& parameters,
-                 const DeviceStageBatch& batch,
-                 cudaStream_t stream = nullptr);
+                 const DeviceStageBatch& batch, cudaStream_t stream = nullptr);
 
     // Packs the split accumulator into the VapourSynth contribution-plane
     // layout [channel][slot][numerator/weight][height][width].

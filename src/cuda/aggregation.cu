@@ -21,6 +21,11 @@ constexpr int warps_per_block = block_threads / warp_width;
 constexpr float minimum_log_weight = -80.0F;
 constexpr float maximum_log_weight = 80.0F;
 
+struct PatchWindowEntry {
+    float weight;
+    int row;
+};
+
 [[noreturn]] void throw_cuda(cudaError_t status, const char* operation) {
     std::ostringstream message;
     message << operation << " failed: " << cudaGetErrorString(status);
@@ -384,13 +389,16 @@ weight_offset(const DeviceContributionView& view, int slot, int y, int x) {
            static_cast<std::ptrdiff_t>(y) * view.weight_row_stride + x;
 }
 
-__global__ void scatter_direct_kernel(AggregationShape shape,
-                                      AggregationParameters parameters,
-                                      DeviceAggregationBatch batch,
-                                      const float* __restrict__ window) {
+__global__ void
+scatter_direct_kernel(AggregationShape shape, AggregationParameters parameters,
+                      DeviceAggregationBatch batch,
+                      const PatchWindowEntry* __restrict__ window) {
     const int group = static_cast<int>(blockIdx.x);
     const int thread = static_cast<int>(threadIdx.x);
     if (group >= batch.groups) {
+        return;
+    }
+    if (batch.active_groups != nullptr && batch.active_groups[group] == 0U) {
         return;
     }
 
@@ -438,7 +446,8 @@ __global__ void scatter_direct_kernel(AggregationShape shape,
             }
             for (int position = lane; position < patch_area;
                  position += warp_width) {
-                const int patch_y = position / shape.patch_size;
+                const PatchWindowEntry window_entry = window[position];
+                const int patch_y = window_entry.row;
                 const int patch_x = position - patch_y * shape.patch_size;
                 const int output_x = match_x + patch_x;
                 const int output_y = match_y + patch_y;
@@ -447,7 +456,7 @@ __global__ void scatter_direct_kernel(AggregationShape shape,
                     continue;
                 }
                 const float contribution_weight =
-                    sample_weight * window[position];
+                    sample_weight * window_entry.weight;
                 atomicAdd(batch.contributions.weights +
                               weight_offset(batch.contributions, slot, output_y,
                                             output_x),
@@ -765,8 +774,12 @@ class Aggregator::Impl {
         const int patch_area =
             checked_product_int(shape.patch_size, shape.patch_size,
                                 "CUDA aggregation patch area overflows");
-        std::vector<float> host_window(static_cast<std::size_t>(patch_area),
-                                       1.0F);
+        std::vector<PatchWindowEntry> host_window(
+            static_cast<std::size_t>(patch_area));
+        for (int position = 0; position < patch_area; ++position) {
+            host_window[static_cast<std::size_t>(position)] =
+                PatchWindowEntry{1.0F, position / shape.patch_size};
+        }
         if (window_gamma != 0.0F && shape.patch_size > 1) {
             const float center =
                 0.5F * static_cast<float>(shape.patch_size - 1);
@@ -778,19 +791,21 @@ class Aggregator::Impl {
                     const float dx = (static_cast<float>(x) - center) / radius;
                     const float raw = std::exp(-0.5F * ((dx * dx) + (dy * dy)));
                     host_window[static_cast<std::size_t>(y * shape.patch_size +
-                                                         x)] = raw;
+                                                         x)]
+                        .weight = raw;
                     maximum = std::max(maximum, raw);
                 }
             }
             const float inverse_maximum =
                 maximum > 0.0F ? 1.0F / maximum : 1.0F;
-            for (float& value : host_window) {
-                value = std::pow(value * inverse_maximum, window_gamma);
+            for (PatchWindowEntry& entry : host_window) {
+                entry.weight =
+                    std::pow(entry.weight * inverse_maximum, window_gamma);
             }
         }
         window_.reserve(host_window.size());
         check_cuda(cudaMemcpy(window_.data(), host_window.data(),
-                              host_window.size() * sizeof(float),
+                              host_window.size() * sizeof(PatchWindowEntry),
                               cudaMemcpyHostToDevice),
                    "cudaMemcpy(aggregation window)");
 
@@ -948,7 +963,7 @@ class Aggregator::Impl {
     std::size_t numerator_values_ = 0;
     std::size_t weight_values_ = 0;
     std::size_t packed_values_ = 0;
-    DeviceBuffer<float> window_;
+    DeviceBuffer<PatchWindowEntry> window_;
 };
 
 Aggregator::Aggregator(int device) : impl_(std::make_unique<Impl>(device)) {}

@@ -29,9 +29,9 @@ struct FilterParameters {
     float weight_beta = 0.35F;
     float weight_epsilon = 1.0e-6F;
     float membership_noise_floor = 0.25F;
-    // Exact noisy-row equality is a CPU fast path.  It is disabled by
-    // default because scanning every retained value solely to discover a
-    // rare shortcut would add an unconditional pass to the GPU hot path.
+    // Enables exact-row and conservative zero-signal model shortcuts while
+    // samples are centered.  The latter is selected only when the complete
+    // covariance trace is no greater than the model-noise variance.
     bool detect_equal_groups = false;
 };
 
@@ -54,10 +54,14 @@ struct GroupBatchShape {
 // basic_samples is ignored.  flat_flags is optional and only consulted for
 // Final; a non-zero value selects the CPU implementation's flat-patch center
 // semantics (basic mean is used for noisy centering and output center).
+// active_groups is optional.  When present, zero entries suppress the group's
+// filter kernels and downstream contribution while fixed-size library batches
+// remain valid.
 struct DeviceGroupBatch {
     const float* noisy_samples = nullptr;
     const float* basic_samples = nullptr;
     const int* retained_counts = nullptr;
+    const std::uint8_t* active_groups = nullptr;
     const std::uint8_t* flat_flags = nullptr;
 
     float* filtered_samples = nullptr;

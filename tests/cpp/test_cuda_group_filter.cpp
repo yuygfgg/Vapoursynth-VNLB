@@ -382,6 +382,7 @@ void require_close(float actual, float expected, float tolerance,
 enum class DataProfile {
     SingleDominant,
     BoundedMultiComponent,
+    SubNoise,
 };
 
 struct CaseOptions {
@@ -392,6 +393,7 @@ struct CaseOptions {
     bool output_eigenvalues = true;
     bool output_basis = true;
     bool external_solver_info = false;
+    bool use_active_groups = false;
     DataProfile profile = DataProfile::SingleDominant;
 };
 
@@ -425,6 +427,7 @@ void run_case(int basis_similar, vnlbcu::Stage stage,
         retained_counts = {basis_similar, basis_similar + 1, basis_similar + 3};
     }
     std::vector<std::uint8_t> flat_flags{0, 1, 0};
+    std::vector<std::uint8_t> active_groups{1, 0, 1};
     std::uint32_t random_state = 0x5eed1234U;
     for (int group = 0; group < shape.groups; ++group) {
         const std::size_t group_base = static_cast<std::size_t>(group) *
@@ -435,7 +438,15 @@ void run_case(int basis_similar, vnlbcu::Stage stage,
                     group_base +
                     static_cast<std::size_t>(sample) * shape.sample_dim +
                     dimension;
-                if (options.profile == DataProfile::SingleDominant) {
+                if (options.profile == DataProfile::SubNoise) {
+                    const float tiny =
+                        1.0e-5F * static_cast<float>(
+                                       ((sample * 17) + (dimension * 13) +
+                                        (group * 7)) %
+                                           23 -
+                                       11);
+                    noisy[index] = 0.25F + tiny;
+                } else if (options.profile == DataProfile::SingleDominant) {
                     const float structured =
                         0.03F * static_cast<float>((sample + 1) *
                                                    ((dimension % 11) - 5));
@@ -512,6 +523,8 @@ void run_case(int basis_similar, vnlbcu::Stage stage,
     DeviceArray<float> device_basic(sample_count);
     DeviceArray<int> device_counts(retained_counts.size());
     DeviceArray<std::uint8_t> device_flat(flat_flags.size());
+    DeviceArray<std::uint8_t> device_active(
+        options.use_active_groups ? active_groups.size() : 0);
     DeviceArray<float> device_filtered(sample_count);
     DeviceArray<float> device_weights(weight_count);
     DeviceArray<float> device_eigenvalues(eigen_count);
@@ -525,6 +538,15 @@ void run_case(int basis_similar, vnlbcu::Stage stage,
         device_counts.upload(std::span<const int>(retained_counts));
     }
     device_flat.upload(std::span<const std::uint8_t>(flat_flags));
+    if (options.use_active_groups) {
+        device_active.upload(std::span<const std::uint8_t>(active_groups));
+        device_filtered.upload(std::span<const float>(
+            std::vector<float>(sample_count, -123.25F)));
+        device_weights.upload(std::span<const float>(
+            std::vector<float>(weight_count, -124.25F)));
+        device_eigenvalues.upload(std::span<const float>(
+            std::vector<float>(eigen_count, -125.25F)));
+    }
     if (options.external_solver_info) {
         check_cuda(
             cudaMemset(device_solver_info.data(), 0x7f,
@@ -540,6 +562,8 @@ void run_case(int basis_similar, vnlbcu::Stage stage,
             stage == vnlbcu::Stage::Final ? device_basic.data() : nullptr,
         .retained_counts =
             options.use_retained_counts ? device_counts.data() : nullptr,
+        .active_groups =
+            options.use_active_groups ? device_active.data() : nullptr,
         .flat_flags =
             stage == vnlbcu::Stage::Final ? device_flat.data() : nullptr,
         .filtered_samples = device_filtered.data(),
@@ -579,7 +603,8 @@ void run_case(int basis_similar, vnlbcu::Stage stage,
 
     if (options.output_eigenvalues) {
         for (int group = 0; group < shape.groups; ++group) {
-            if (group == 2) {
+            if (group == 2 ||
+                (options.use_active_groups && active_groups[group] == 0U)) {
                 continue;
             }
             failure_context.group = group;
@@ -608,6 +633,35 @@ void run_case(int basis_similar, vnlbcu::Stage stage,
                                         shape.sample_dim;
         const std::size_t weight_base =
             static_cast<std::size_t>(group) * shape.retained_stride;
+        if (options.use_active_groups && active_groups[group] == 0U) {
+            for (int sample = 0; sample < similar; ++sample) {
+                const std::size_t inactive_sample_base =
+                    sample_base +
+                    static_cast<std::size_t>(sample) * shape.sample_dim;
+                for (int dimension = 0; dimension < shape.sample_dim;
+                     ++dimension) {
+                    require_close(actual_filtered[inactive_sample_base +
+                                                  dimension],
+                                  -123.25F, 0.0F,
+                                  "inactive filtered sample");
+                }
+                if (options.output_log_weights) {
+                    require_close(actual_weights[weight_base + sample],
+                                  -124.25F, 0.0F,
+                                  "inactive log patch weight");
+                }
+            }
+            if (options.output_eigenvalues) {
+                const std::size_t eigen_base =
+                    static_cast<std::size_t>(group) * shape.rank;
+                for (int component = 0; component < shape.rank; ++component) {
+                    require_close(actual_eigenvalues[eigen_base + component],
+                                  -125.25F, 0.0F,
+                                  "inactive selected eigenvalue");
+                }
+            }
+            continue;
+        }
         for (int sample = 0; sample < similar; ++sample) {
             failure_context.sample = sample;
             for (int dimension = 0; dimension < shape.sample_dim; ++dimension) {
@@ -646,6 +700,12 @@ int main() {
         run_case(17, vnlbcu::Stage::Basic);
         run_case(15, vnlbcu::Stage::Final);
         run_case(17, vnlbcu::Stage::Final);
+        run_case(15, vnlbcu::Stage::Basic,
+                 CaseOptions{.external_solver_info = true,
+                             .use_active_groups = true});
+        run_case(15, vnlbcu::Stage::Final,
+                 CaseOptions{.external_solver_info = true,
+                             .use_active_groups = true});
         // The tuned reference RGB profile uses K=100/60 and rank 39.  These
         // cases exercise the runtime-size path beyond a single warp and check
         // that batched cuSOLVER converges without a per-group fallback.
@@ -659,6 +719,16 @@ int main() {
                      .sample_dim = 128,
                      .external_solver_info = true,
                      .profile = DataProfile::BoundedMultiComponent,
+                 });
+        // Non-identical groups whose complete covariance trace is below the
+        // model-noise floor have no positive signal eigenvalue.  They bypass
+        // the solver but still use the normal center/weight path.
+        run_case(100, vnlbcu::Stage::Basic,
+                 CaseOptions{
+                     .rank = 39,
+                     .sample_dim = 128,
+                     .external_solver_info = true,
+                     .profile = DataProfile::SubNoise,
                  });
         run_case(60, vnlbcu::Stage::Final,
                  CaseOptions{.rank = 39,

@@ -14,6 +14,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -99,9 +100,28 @@ class Event {
 };
 
 int parse_positive(const char* value, const char* name) {
-    const int parsed = std::stoi(value);
+    const std::string text(value);
+    std::size_t consumed = 0;
+    const int parsed = std::stoi(text, &consumed);
+    if (consumed != text.size()) {
+        throw std::invalid_argument(std::string(name) + " must be an integer");
+    }
     if (parsed <= 0) {
         throw std::invalid_argument(std::string(name) + " must be positive");
+    }
+    return parsed;
+}
+
+int parse_nonnegative(const char* value, const char* name) {
+    const std::string text(value);
+    std::size_t consumed = 0;
+    const int parsed = std::stoi(text, &consumed);
+    if (consumed != text.size()) {
+        throw std::invalid_argument(std::string(name) + " must be an integer");
+    }
+    if (parsed < 0) {
+        throw std::invalid_argument(std::string(name) +
+                                    " must be non-negative");
     }
     return parsed;
 }
@@ -141,6 +161,53 @@ VideoStorage parse_video_storage(const char* value) {
     throw std::invalid_argument("video storage must be contiguous or pointers");
 }
 
+vnlbcu::MatchStrategy parse_strategy(const char* value) {
+    const std::string strategy(value);
+    if (strategy == "auto") {
+        return vnlbcu::MatchStrategy::Auto;
+    }
+    if (strategy == "fused") {
+        return vnlbcu::MatchStrategy::Fused;
+    }
+    if (strategy == "chunked") {
+        return vnlbcu::MatchStrategy::Chunked;
+    }
+    if (strategy == "full-sort") {
+        return vnlbcu::MatchStrategy::FullSort;
+    }
+    throw std::invalid_argument(
+        "strategy must be auto, fused, chunked, or full-sort");
+}
+
+const char* strategy_name(vnlbcu::MatchStrategy strategy) {
+    switch (strategy) {
+    case vnlbcu::MatchStrategy::Auto:
+        return "auto";
+    case vnlbcu::MatchStrategy::Fused:
+        return "fused";
+    case vnlbcu::MatchStrategy::Chunked:
+        return "chunked";
+    case vnlbcu::MatchStrategy::FullSort:
+        return "full-sort";
+    }
+    return "unknown";
+}
+
+void print_usage(std::ostream& output) {
+    output << "usage: benchmark_cuda_block_match [K] [groups] [iterations] "
+              "[basic|final] [topk|cap] [patch_time] "
+              "[contiguous|pointers] [options]\n"
+           << "options:\n"
+           << "  --patch N\n"
+           << "  --channels N\n"
+           << "  --window N\n"
+           << "  --search-bwd N\n"
+           << "  --search-fwd N\n"
+           << "  --retained N|all\n"
+           << "  --strategy auto|fused|chunked|full-sort\n"
+           << "  --csv\n";
+}
+
 float next_random(std::uint32_t& state) {
     state = (state * 1664525U) + 1013904223U;
     return static_cast<float>((state >> 8U) & 0x00ffffffU) /
@@ -151,12 +218,103 @@ float next_random(std::uint32_t& state) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc > 8) {
-            throw std::invalid_argument(
-                "usage: benchmark_cuda_block_match [K] [groups] "
-                "[iterations] [basic|final] [topk|cap] [patch_time] "
-                "[contiguous|pointers]");
+        int requested = 17;
+        int groups = 256;
+        int iterations = 100;
+        vnlbcu::Stage stage = vnlbcu::Stage::Basic;
+        bool expand_to_cap = false;
+        int patch_time = 1;
+        VideoStorage video_storage = VideoStorage::Contiguous;
+
+        int channels = 3;
+        int patch = 8;
+        int search_window = 19;
+        int search_bwd = 1;
+        int search_fwd = 1;
+        int retained_option = 0;
+        bool retain_all = false;
+        vnlbcu::MatchStrategy requested_strategy = vnlbcu::MatchStrategy::Auto;
+        bool csv = false;
+
+        int argument = 1;
+        int positional = 0;
+        while (argument < argc &&
+               !std::string_view(argv[argument]).starts_with("--")) {
+            switch (positional) {
+            case 0:
+                requested = parse_positive(argv[argument], "K");
+                break;
+            case 1:
+                groups = parse_positive(argv[argument], "groups");
+                break;
+            case 2:
+                iterations = parse_positive(argv[argument], "iterations");
+                break;
+            case 3:
+                stage = parse_stage(argv[argument]);
+                break;
+            case 4:
+                expand_to_cap = parse_expand_to_cap(argv[argument]);
+                break;
+            case 5:
+                patch_time = parse_positive(argv[argument], "patch_time");
+                break;
+            case 6:
+                video_storage = parse_video_storage(argv[argument]);
+                break;
+            default:
+                throw std::invalid_argument(
+                    "at most seven positional arguments are accepted");
+            }
+            ++argument;
+            ++positional;
         }
+
+        const auto option_value = [&](std::string_view option) -> const char* {
+            if (++argument >= argc) {
+                throw std::invalid_argument(std::string(option) +
+                                            " requires a value");
+            }
+            return argv[argument];
+        };
+        while (argument < argc) {
+            const std::string_view option(argv[argument]);
+            if (option == "--help") {
+                print_usage(std::cout);
+                return EXIT_SUCCESS;
+            }
+            if (option == "--csv") {
+                csv = true;
+            } else if (option == "--patch") {
+                patch = parse_positive(option_value(option), "patch");
+            } else if (option == "--channels") {
+                channels = parse_positive(option_value(option), "channels");
+            } else if (option == "--window") {
+                search_window = parse_positive(option_value(option), "window");
+            } else if (option == "--search-bwd") {
+                search_bwd =
+                    parse_nonnegative(option_value(option), "search-bwd");
+            } else if (option == "--search-fwd") {
+                search_fwd =
+                    parse_nonnegative(option_value(option), "search-fwd");
+            } else if (option == "--retained") {
+                const char* value = option_value(option);
+                if (std::string_view(value) == "all") {
+                    retain_all = true;
+                    retained_option = 0;
+                } else {
+                    retained_option = parse_positive(value, "retained");
+                    retain_all = false;
+                }
+            } else if (option == "--strategy") {
+                requested_strategy = parse_strategy(option_value(option));
+            } else {
+                throw std::invalid_argument("unknown option: " +
+                                            std::string(option));
+            }
+            ++argument;
+        }
+
         int device_count = 0;
         check_cuda(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount");
         if (device_count == 0) {
@@ -164,31 +322,45 @@ int main(int argc, char** argv) {
             return EXIT_FAILURE;
         }
 
-        const int requested = argc > 1 ? parse_positive(argv[1], "K") : 17;
-        const int groups = argc > 2 ? parse_positive(argv[2], "groups") : 256;
-        const int iterations =
-            argc > 3 ? parse_positive(argv[3], "iterations") : 100;
-        const vnlbcu::Stage stage =
-            argc > 4 ? parse_stage(argv[4]) : vnlbcu::Stage::Basic;
-        const bool expand_to_cap =
-            argc > 5 ? parse_expand_to_cap(argv[5]) : false;
-        const int patch_time =
-            argc > 6 ? parse_positive(argv[6], "patch_time") : 1;
-        const VideoStorage video_storage =
-            argc > 7 ? parse_video_storage(argv[7]) : VideoStorage::Contiguous;
-
         constexpr int width = 640;
         constexpr int height = 360;
-        constexpr int channels = 3;
-        constexpr int patch = 8;
-        constexpr int search_window = 19;
-        constexpr int temporal = 3;
-        const int frames = patch_time + temporal - 1;
-        constexpr int candidates = search_window * search_window * temporal;
+        if (patch > width || patch > height) {
+            throw std::invalid_argument(
+                "patch exceeds the benchmark frame dimensions");
+        }
+        if ((search_window & 1) == 0) {
+            throw std::invalid_argument("window must be odd");
+        }
+        const long long temporal_wide =
+            static_cast<long long>(search_bwd) + search_fwd + 1;
+        const long long frames_wide =
+            static_cast<long long>(patch_time) + temporal_wide - 1;
+        if (frames_wide > std::numeric_limits<int>::max()) {
+            throw std::length_error("benchmark frame count overflows int");
+        }
+        const int temporal = static_cast<int>(temporal_wide);
+        const int frames = static_cast<int>(frames_wide);
+        const int window_width = std::min(search_window, width - patch + 1);
+        const int window_height = std::min(search_window, height - patch + 1);
+        const long long candidates_wide =
+            static_cast<long long>(window_width) * window_height * temporal;
+        if (candidates_wide > std::numeric_limits<int>::max()) {
+            throw std::length_error("benchmark candidate count overflows int");
+        }
+        const int candidates = static_cast<int>(candidates_wide);
         if (requested > candidates) {
             throw std::invalid_argument("K exceeds the benchmark candidates");
         }
-        const int retained = std::min(candidates, requested * 4);
+        const int retained =
+            retain_all ? candidates
+            : retained_option > 0
+                ? retained_option
+                : static_cast<int>(std::min<long long>(
+                      candidates, static_cast<long long>(requested) * 4));
+        if (retained < requested || retained > candidates) {
+            throw std::invalid_argument(
+                "retained must be between K and the candidate count");
+        }
         const vnlbcu::MatchBatchShape shape{
             .stage = stage,
             .groups = groups,
@@ -201,10 +373,11 @@ int main(int argc, char** argv) {
             .patch_size = patch,
             .patch_time = patch_time,
             .search_window = search_window,
-            .search_bwd = 1,
-            .search_fwd = 1,
+            .search_bwd = search_bwd,
+            .search_fwd = search_fwd,
             .requested_similar = requested,
             .retained_stride = retained,
+            .strategy = requested_strategy,
         };
         const int sample_dim = channels * patch * patch * patch_time;
         const std::size_t video_count =
@@ -363,24 +536,58 @@ int main(int argc, char** argv) {
             static_cast<double>(std::accumulate(retained_counts.begin(),
                                                 retained_counts.end(), 0LL)) /
             groups;
-        std::cout << std::fixed << std::setprecision(3)
-                  << "vnlbcu matcher: stage="
-                  << (stage == vnlbcu::Stage::Basic ? "basic" : "final")
-                  << " retention=" << (expand_to_cap ? "cap" : "topk")
-                  << " storage="
-                  << (video_storage == VideoStorage::Contiguous ? "contiguous"
-                                                                : "pointers")
-                  << " P=" << patch << " Pt=" << patch_time
-                  << " K=" << requested << " C=" << retained
-                  << " candidates=" << matcher.candidate_count()
-                  << " groups=" << groups << '\n'
-                  << "retained S: min=" << *minimum_count
-                  << " average=" << average_count << " max=" << *maximum_count
-                  << '\n'
-                  << "average batch: " << batch_ms << " ms\n"
-                  << "throughput: " << anchors_per_second << " anchors/s, "
-                  << candidates_per_second / 1.0e6
-                  << " M candidate patches/s\n";
+        const char* const stage_name =
+            stage == vnlbcu::Stage::Basic ? "basic" : "final";
+        const char* const retention_name = expand_to_cap ? "cap" : "topk";
+        const char* const storage_name =
+            video_storage == VideoStorage::Contiguous ? "contiguous"
+                                                      : "pointers";
+        if (csv) {
+            std::cout
+                << "requested_strategy,chosen_strategy,stage,retention,storage,"
+                   "channels,patch,patch_time,window,window_width,window_"
+                   "height,"
+                   "search_bwd,search_fwd,temporal,candidates,K,C,groups,"
+                   "iterations,retained_min,retained_average,retained_max,"
+                   "batch_ms,workspace_bytes,anchors_per_second,"
+                   "candidates_per_second\n"
+                << strategy_name(requested_strategy) << ','
+                << strategy_name(matcher.strategy()) << ',' << stage_name << ','
+                << retention_name << ',' << storage_name << ',' << channels
+                << ',' << patch << ',' << patch_time << ',' << search_window
+                << ',' << window_width << ',' << window_height << ','
+                << search_bwd << ',' << search_fwd << ',' << temporal << ','
+                << matcher.candidate_count() << ',' << requested << ','
+                << retained << ',' << groups << ',' << iterations << ','
+                << *minimum_count << ',' << std::fixed << std::setprecision(6)
+                << average_count << ',' << *maximum_count << ',' << batch_ms
+                << ',' << matcher.workspace_bytes() << ',' << anchors_per_second
+                << ',' << candidates_per_second << '\n';
+        } else {
+            std::cout << std::fixed << std::setprecision(3)
+                      << "vnlbcu matcher: stage=" << stage_name
+                      << " retention=" << retention_name
+                      << " storage=" << storage_name
+                      << " strategy=" << strategy_name(requested_strategy)
+                      << "->" << strategy_name(matcher.strategy())
+                      << " Ch=" << channels << " P=" << patch
+                      << " Pt=" << patch_time << " W=" << search_window
+                      << " Wx=" << window_width << " Wy=" << window_height
+                      << " Tb=" << search_bwd << " Tf=" << search_fwd
+                      << " T=" << temporal << " K=" << requested
+                      << " C=" << retained
+                      << " candidates=" << matcher.candidate_count()
+                      << " groups=" << groups << '\n'
+                      << "retained S: min=" << *minimum_count
+                      << " average=" << average_count
+                      << " max=" << *maximum_count << '\n'
+                      << "average batch: " << batch_ms << " ms\n"
+                      << "workspace: " << matcher.workspace_bytes()
+                      << " bytes\n"
+                      << "throughput: " << anchors_per_second << " anchors/s, "
+                      << candidates_per_second / 1.0e6
+                      << " M candidate patches/s\n";
+        }
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

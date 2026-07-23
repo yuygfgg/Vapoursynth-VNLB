@@ -56,8 +56,10 @@ def request_all(clip: vs.VideoNode) -> list[vs.VideoFrame]:
     return [future.result(timeout=30.0) for future in futures]
 
 
-def check_frames(frames: list[vs.VideoFrame], label: str) -> None:
-    if len(frames) != 7:
+def check_frames(
+    frames: list[vs.VideoFrame], label: str, expected_count: int = 7
+) -> None:
+    if len(frames) != expected_count:
         fail(f"{label}: unexpected frame count")
 
     prior_mean = -math.inf
@@ -109,6 +111,11 @@ def compare_frames(
                     difference = abs(
                         float(actual_plane[y, x]) - float(expected_plane[y, x])
                     )
+                    if not math.isfinite(difference):
+                        fail(
+                            f"{label}: frame {frame_number}, plane {plane_number}, "
+                            f"sample ({x}, {y}) is non-finite"
+                        )
                     if difference > tolerance:
                         fail(
                             f"{label}: frame {frame_number}, plane {plane_number}, "
@@ -130,8 +137,11 @@ def is_missing_cuda(error: BaseException) -> bool:
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("usage: integration_cuda.py /absolute/path/to/libvnlbcu.so")
+    if len(sys.argv) not in (2, 3):
+        print(
+            "usage: integration_cuda.py /absolute/path/to/libvnlbcu.so "
+            "[/absolute/path/to/libvnlb.so]"
+        )
         return 2
 
     plugin = Path(sys.argv[1]).resolve()
@@ -142,12 +152,95 @@ def main() -> int:
 
     source = make_pattern_clip(core)
     try:
+        if len(sys.argv) == 3:
+            cpu_plugin = Path(sys.argv[2]).resolve()
+            core.std.LoadPlugin(
+                path=str(cpu_plugin),
+                forcens="vnlb_cpu_test",
+                forceid="com.yuygfgg.vnlb.cpu-test",
+            )
+            common_parameters = {
+                "sigma": 8.0,
+                "block_size": 7,
+                "block_step": 3,
+                "group_size": 16,
+                "cap_factor": 4.0,
+                "model_cap_factor": 1.0,
+                "bm_range": 13,
+                "patch_time": 2,
+                "radius": 1,
+                "search_bwd": 1,
+                "search_fwd": 1,
+                "rank": 15,
+                "beta": 1.0,
+                "chroma": 1,
+            }
+            basic_parameters = {
+                **common_parameters,
+                "tau": 0.0,
+                "variance_threshold": 2.7,
+                "weight_alpha": 0.75,
+                "weight_beta": 0.35,
+                "weight_gamma": 1.0,
+                "weight_epsilon": 1.0e-6,
+                "membership_noise_floor": 0.25,
+            }
+            final_parameters = {
+                **common_parameters,
+                "tau": 400.0,
+                "variance_threshold": 0.7,
+                "sigma_basic": 0.0,
+                "gamma": 0.95,
+                "flat_areas": 1,
+                "weight_alpha": 1.0,
+                "weight_beta": 0.5,
+                "weight_gamma": 1.0,
+                "weight_epsilon": 1.0e-6,
+                "membership_noise_floor": 0.25,
+            }
+
+            cpu_basic_stack = core.vnlb_cpu_test.Basic(
+                source, **basic_parameters
+            )
+            cpu_basic = core.vnlb_cpu_test.Aggregate(
+                cpu_basic_stack, source, patch_time=2, radius=1
+            )
+            cuda_basic = core.vnlbcu.Basic(
+                source,
+                **basic_parameters,
+                num_streams=1,
+                chunk_size=64,
+            )
+            compare_frames(
+                [cuda_basic.get_frame(3)],
+                [cpu_basic.get_frame(3)],
+                "CPU-compatible staggered Basic anchors",
+                tolerance=5.0e-4,
+            )
+
+            cpu_final_stack = core.vnlb_cpu_test.Final(
+                source, ref=cpu_basic, **final_parameters
+            )
+            cpu_final = core.vnlb_cpu_test.Aggregate(
+                cpu_final_stack, source, patch_time=2, radius=1
+            )
+            cuda_final = core.vnlbcu.Final(
+                source,
+                ref=cuda_basic,
+                **final_parameters,
+                num_streams=1,
+                chunk_size=64,
+            )
+            compare_frames(
+                [cuda_final.get_frame(3)],
+                [cpu_final.get_frame(3)],
+                "CPU-compatible staggered Final anchors",
+                tolerance=5.0e-4,
+            )
+
         default_basic = core.vnlbcu.Basic(
             clip=source,
             sigma=8.0,
-            rank=9,
-            radius=1,
-            num_streams=3,
             chunk_size=64,
         )
         default_basic_frames = request_all(default_basic)
@@ -156,11 +249,16 @@ def main() -> int:
         explicit_basic = core.vnlbcu.Basic(
             clip=source,
             sigma=8.0,
-            group_size=15,
-            block_step=4,
-            rank=9,
-            radius=1,
-            num_streams=3,
+            block_size=10,
+            block_step=5,
+            group_size=16,
+            bm_range=13,
+            patch_time=2,
+            search_bwd=1,
+            search_fwd=1,
+            rank=15,
+            variance_threshold=3.7,
+            num_streams=1,
             chunk_size=64,
         )
         explicit_basic_frames = request_all(explicit_basic)
@@ -174,10 +272,9 @@ def main() -> int:
         zero_step_basic = core.vnlbcu.Basic(
             clip=source,
             sigma=8.0,
-            group_size=15,
+            group_size=16,
             block_step=0,
-            rank=9,
-            radius=1,
+            rank=15,
             num_streams=3,
             chunk_size=64,
         )
@@ -193,9 +290,6 @@ def main() -> int:
             clip=source,
             ref=default_basic,
             sigma=8.0,
-            rank=16,
-            radius=1,
-            num_streams=3,
             chunk_size=64,
         )
         default_final_frames = request_all(default_final)
@@ -205,11 +299,16 @@ def main() -> int:
             clip=source,
             ref=default_basic,
             sigma=8.0,
-            group_size=17,
-            block_step=4,
-            rank=16,
-            radius=1,
-            num_streams=3,
+            block_size=10,
+            block_step=5,
+            group_size=16,
+            bm_range=13,
+            patch_time=2,
+            search_bwd=1,
+            search_fwd=1,
+            rank=15,
+            variance_threshold=max(0.0, 1.87 - (0.028 * 8.0)),
+            num_streams=1,
             chunk_size=64,
         )
         explicit_final_frames = request_all(explicit_final)
@@ -220,39 +319,150 @@ def main() -> int:
             "Final omitted defaults versus explicit values",
         )
 
+        single_source = core.std.Trim(source, first=0, last=0)
+        single_default = core.vnlbcu.Basic(
+            clip=single_source,
+            sigma=8.0,
+            block_step=16,
+            num_streams=1,
+            chunk_size=16,
+        )
+        single_explicit = core.vnlbcu.Basic(
+            clip=single_source,
+            sigma=8.0,
+            block_size=10,
+            block_step=16,
+            group_size=16,
+            bm_range=13,
+            patch_time=1,
+            radius=0,
+            rank=15,
+            variance_threshold=3.7,
+            num_streams=1,
+            chunk_size=16,
+        )
+        single_default_frames = request_all(single_default)
+        single_explicit_frames = request_all(single_explicit)
+        check_frames(single_default_frames, "single-frame Basic", expected_count=1)
+        compare_frames(
+            single_default_frames,
+            single_explicit_frames,
+            "single-frame Gray defaults",
+        )
+
         # Exercise the runtime-size dual-PCA path with the K/rank values from
         # the tuned reference RGB profile.  A sparse anchor grid keeps the
         # integration test small; the C++ group-filter test checks all samples
         # against a double-precision oracle.
         yuv_source = make_yuv_pattern_clip(core, source)
-        large_basic = core.vnlbcu.Basic(
+        default_large_basic = core.vnlbcu.Basic(
             clip=yuv_source,
             sigma=8.0,
-            group_size=100,
-            rank=39,
             cap_factor=1.0,
             block_step=16,
             radius=0,
-            num_streams=2,
             chunk_size=32,
         )
+        explicit_default_large_basic = core.vnlbcu.Basic(
+            clip=yuv_source,
+            sigma=8.0,
+            block_size=7,
+            group_size=16,
+            rank=15,
+            cap_factor=1.0,
+            bm_range=13,
+            patch_time=2,
+            block_step=16,
+            radius=0,
+            variance_threshold=2.7,
+            num_streams=1,
+            chunk_size=32,
+        )
+        large_basic = core.vnlbcu.Basic(
+            clip=yuv_source,
+            sigma=8.0,
+            block_size=7,
+            group_size=100,
+            rank=39,
+            cap_factor=1.0,
+            bm_range=13,
+            patch_time=2,
+            block_step=16,
+            radius=0,
+            variance_threshold=2.7,
+            num_streams=1,
+            chunk_size=32,
+        )
+        default_large_basic_frames = request_all(default_large_basic)
+        explicit_default_large_basic_frames = request_all(
+            explicit_default_large_basic
+        )
         large_basic_frames = request_all(large_basic)
+        check_frames(default_large_basic_frames, "YUV Basic defaults")
         check_frames(large_basic_frames, "Basic K100")
+        compare_frames(
+            default_large_basic_frames,
+            explicit_default_large_basic_frames,
+            "YUV Basic omitted defaults versus explicit values",
+        )
 
+        default_large_final = core.vnlbcu.Final(
+            clip=yuv_source,
+            ref=large_basic,
+            sigma=8.0,
+            cap_factor=1.0,
+            block_step=16,
+            radius=0,
+            chunk_size=32,
+        )
+        explicit_default_large_final = core.vnlbcu.Final(
+            clip=yuv_source,
+            ref=large_basic,
+            sigma=8.0,
+            block_size=7,
+            group_size=16,
+            rank=15,
+            cap_factor=1.0,
+            bm_range=13,
+            patch_time=2,
+            block_step=16,
+            radius=0,
+            variance_threshold=max(
+                0.2, 1.7 + ((1.2 - 1.7) * (8.0 - 10.0) / 10.0)
+            ),
+            num_streams=1,
+            chunk_size=32,
+        )
         large_final = core.vnlbcu.Final(
             clip=yuv_source,
             ref=large_basic,
             sigma=8.0,
+            block_size=7,
             group_size=60,
             rank=39,
             cap_factor=1.0,
+            bm_range=13,
+            patch_time=2,
             block_step=16,
             radius=0,
-            num_streams=2,
+            variance_threshold=max(
+                0.2, 1.7 + ((1.2 - 1.7) * (8.0 - 10.0) / 10.0)
+            ),
+            num_streams=1,
             chunk_size=32,
         )
+        default_large_final_frames = request_all(default_large_final)
+        explicit_default_large_final_frames = request_all(
+            explicit_default_large_final
+        )
         large_final_frames = request_all(large_final)
+        check_frames(default_large_final_frames, "YUV Final defaults")
         check_frames(large_final_frames, "Final K60")
+        compare_frames(
+            default_large_final_frames,
+            explicit_default_large_final_frames,
+            "YUV Final omitted defaults versus explicit values",
+        )
 
         try:
             core.vnlbcu.Basic(

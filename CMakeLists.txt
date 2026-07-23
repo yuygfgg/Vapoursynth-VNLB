@@ -728,6 +728,7 @@ if(VNLB_ENABLE_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_isolated_vs.py"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/vs/integration_cuda.py"
             "$<TARGET_FILE:vnlbcu>"
+            "$<TARGET_FILE:vnlb>"
           WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         )
         set_tests_properties(vs-integration-cuda PROPERTIES

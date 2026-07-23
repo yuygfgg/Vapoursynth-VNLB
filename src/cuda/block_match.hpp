@@ -56,6 +56,13 @@ struct PatchMatch {
     int frame = 0;
 };
 
+enum class MatchStrategy : std::uint8_t {
+    Auto,
+    Fused,
+    Chunked,
+    FullSort,
+};
+
 struct MatchBatchShape {
     Stage stage = Stage::Basic;
     int groups = 0;
@@ -76,6 +83,9 @@ struct MatchBatchShape {
     // candidates.  It must cover min(K,candidate_count).  The kernel computes
     // only the true retained count S<=C.
     int retained_stride = 0;
+    // Auto selects a strategy from the reserved geometry.  The explicit modes
+    // are primarily useful for benchmarking and diagnostics.
+    MatchStrategy strategy = MatchStrategy::Auto;
 };
 
 struct MatchParameters {
@@ -119,17 +129,16 @@ class BlockMatcher final {
     BlockMatcher& operator=(BlockMatcher&&) noexcept;
 
     // Validates the fixed source geometry, records groups as the maximum batch
-    // size, and configures the common fused kernels.  Enqueue accepts smaller
-    // group counts and different first_frame/frames cache windows, since those
-    // do not affect kernel selection or shared-memory sizing.  The current
-    // fast path supports at most 2048 candidates per anchor; this covers the
-    // default 19x19x3 search without a global distance stack.
+    // size, and configures the selected matching strategy.  Enqueue accepts
+    // smaller group counts and different first_frame/frames cache windows,
+    // since those do not affect kernel selection or shared-memory sizing.
     void reserve(const MatchBatchShape& shape);
 
     // Enqueues matching, stable (distance, scan-order) selection, tau
-    // expansion and direct noisy/basic gather as one kernel per whole batch.
-    // There are no host/device copies, allocations, or synchronizations here.
-    // One instance is not thread-safe and must not be submitted concurrently.
+    // expansion and direct noisy/basic gather.  Fallback strategies use
+    // multiple kernels, but there are no host/device copies, allocations, or
+    // synchronizations here.  One instance is not thread-safe and must not be
+    // submitted concurrently.
     void enqueue(const MatchBatchShape& shape,
                  const MatchParameters& parameters,
                  const DeviceMatchBatch& batch, cudaStream_t stream = nullptr);
@@ -137,6 +146,7 @@ class BlockMatcher final {
     [[nodiscard]] int candidate_count() const noexcept;
     [[nodiscard]] int temporal_count() const noexcept;
     [[nodiscard]] int sample_dim() const noexcept;
+    [[nodiscard]] MatchStrategy strategy() const noexcept;
     [[nodiscard]] std::size_t workspace_bytes() const noexcept;
     [[nodiscard]] int device() const noexcept;
 

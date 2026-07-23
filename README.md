@@ -235,31 +235,55 @@ vnlb.Aggregate(clip clip, clip src[, int patch_time=1, int radius=1, int search_
 #### basic estimate of CUDA VNLB
 
 ```python
-vnlbcu.Basic(clip clip, float sigma[, int block_size=8, int block_step=0, int group_size=15, float cap_factor=4.0, float model_cap_factor=1.0, int bm_range=9, int patch_time=1, int radius=1, int search_bwd=1, int search_fwd=1, int rank=8, float beta=1.0, float tau=0.0, float variance_threshold=1.1, float weight_alpha=0.75, float weight_beta=0.35, float weight_gamma=1.0, float weight_epsilon=1e-6, float membership_noise_floor=0.25, int chroma=1, int device_id=0, int num_streams, int chunk_size=256])
+vnlbcu.Basic(clip clip, float sigma[, int block_size=(clip.format == GrayS ? 10 : 7), int block_step=0, int group_size=16, float cap_factor=4.0, float model_cap_factor=1.0, int bm_range=13, int patch_time=(clip.numFrames > 1 ? 2 : 1), int radius=(clip.numFrames > patch_time ? 1 : 0), int search_bwd=(clip.numFrames > patch_time ? 1 : 0), int search_fwd=(clip.numFrames > patch_time ? 1 : 0), int rank=15, float beta=1.0, float tau=0.0, float variance_threshold=(clip.format == GrayS ? 3.7 : 2.7), float weight_alpha=0.75, float weight_beta=0.35, float weight_gamma=1.0, float weight_epsilon=1e-6, float membership_noise_floor=0.25, int chroma=1, int device_id=0, int num_streams=1, int chunk_size=768])
 ```
 
-The denoising parameters have the same meaning as in `vnlb.Basic`, with these CUDA-specific defaults and options:
+- `block_step=0` selects `max(1, block_size // 2)`.
 
-- `block_step=0` selects `max(1, block_size // 2)`; it is `4` for the default `8x8` patch.
-- `group_size` defaults to `15`.
 - `device_id` selects the CUDA device.
-- `num_streams` defaults to `min(VapourSynth threads, 4)` and accepts `1..32`.
-- `chunk_size` is the maximum number of anchor groups submitted together and defaults to `256`.
+
+- `num_streams` defaults to `1` and accepts `1..32`.
+
+- `chunk_size` is the maximum number of anchor groups submitted together and defaults to `768`. Larger batches amortize kernel launches and improve the batched eigensolver's throughput, but chunk-local workspace grows roughly linearly; lower this value on memory-constrained devices.
 
 #### final estimate of CUDA VNLB
 
 ```python
-vnlbcu.Final(clip clip, clip ref, float sigma[, int block_size=8, int block_step=0, int group_size=17, float cap_factor=4.0, float model_cap_factor=1.0, int bm_range=9, int patch_time=1, int radius=1, int search_bwd=1, int search_fwd=1, int rank=8, float beta=1.0, float tau=400.0, float variance_threshold=1.7, float weight_alpha=1.0, float weight_beta=0.5, float weight_gamma=1.0, float weight_epsilon=1e-6, float membership_noise_floor=0.25, int chroma=1, int device_id=0, int num_streams, int chunk_size=256, float sigma_basic=0.0, float gamma=0.95, int flat_areas=1])
+vnlbcu.Final(clip clip, clip ref, float sigma[, int block_size=(clip.format == GrayS ? 10 : 7), int block_step=0, int group_size=16, float cap_factor=4.0, float model_cap_factor=1.0, int bm_range=13, int patch_time=(clip.numFrames > 1 ? 2 : 1), int radius=(clip.numFrames > patch_time ? 1 : 0), int search_bwd=(clip.numFrames > patch_time ? 1 : 0), int search_fwd=(clip.numFrames > patch_time ? 1 : 0), int rank=15, float beta=1.0, float tau=400.0, float variance_threshold=(clip.format == GrayS ? max(0.0, 1.87 - 0.028 * sigma) : max(0.2, 1.7 - 0.05 * (sigma - 10))), float weight_alpha=1.0, float weight_beta=0.5, float weight_gamma=1.0, float weight_epsilon=1e-6, float membership_noise_floor=0.25, int chroma=1, int device_id=0, int num_streams=1, int chunk_size=768, float sigma_basic=0.0, float gamma=0.95, int flat_areas=1])
 ```
 
 `ref`, `sigma_basic`, `gamma` and `flat_areas` have the same meaning as in `vnlb.Final`.
+
+The table lists the nominal defaults for a multi-frame clip with an available temporal search origin.
+
+| Parameter | Gray Basic | Gray Final | YUV444 Basic | YUV444 Final |
+| --- | ---: | ---: | ---: | ---: |
+| `block_size` | `10` | `10` | `7` | `7` |
+| `patch_time` | `2` | `2` | `2` | `2` |
+| `bm_range` | `13` | `13` | `13` | `13` |
+| `search_bwd`, `search_fwd` | `1`, `1` | `1`, `1` | `1`, `1` | `1`, `1` |
+| `group_size` | `16` | `16` | `16` | `16` |
+| `rank` | `15` | `15` | `15` | `15` |
+| `tau` | `0` | `400` | `0` | `400` |
+| `variance_threshold` | `3.7` | `max(0, 1.87 - 0.028 * sigma)` | `2.7` | `max(0.2, 1.7 - 0.05 * (sigma - 10))` |
+| automatic `block_step` | `5` | `5` | `3` | `3` |
+
+For a one-frame clip, the default `patch_time` degrades to `1`. The default
+temporal search radius is `1` only when `numFrames > patch_time`; otherwise it
+degrades to `0` (for example, a two-frame clip using the default `patch_time=2`).
+If an omitted `group_size` or `rank` no longer fits the resulting patch
+dimension or candidate count, it is reduced to the largest valid value.
+Explicit values are never silently changed.
+
+> [!NOTE]
+> cuSolver's batched Jacobi solver becomes dramatically slower above a 32-sample model. Larger values may be substantially slower.
 
 The main default differences are:
 
 | Parameter | CUDA Basic / Final | CPU Basic / Final |
 | --- | --- | --- |
-| `group_size` | `15 / 17` | `8 / 8` |
-| automatic `block_step` | `block_size // 2` | `block_size` |
+| `group_size` | `16 / 16` | `8 / 8` |
+| `block_step` | Gray `5`, YUV444 `3` | `block_size` |
 | output | normal video frame | contribution stack |
 | `chroma` | `1` only | `0` or `1` |
 | `model_cap_factor` | `1.0` only | configurable |
@@ -270,7 +294,6 @@ The main default differences are:
 - Only coupled processing is supported, `chroma=0` is not supported.
 - `model_cap_factor` must be `1.0`.
 - The effective model group `K=min(group_size, candidate count)` must satisfy `K<=128`, `rank<=K`, and `K<D`, where `D=channels * block_size^2 * patch_time`.
-- The fused one-block matcher accepts at most `2048` candidates per anchor.
 - MVTools guidance is not available.
 
 
