@@ -403,6 +403,64 @@ void test_loading_key_waits_for_publish() {
     owner.release();
 }
 
+void test_deferred_loading_hit_waits_at_consumption() {
+    auto backend = std::make_shared<FakeBackend>();
+    vnlbcu::FrameCache cache(2, 64, backend);
+    const std::array owner_keys{key(32)};
+    auto owner = cache.acquire(owner_keys);
+
+    const std::array follower_keys{key(32), key(33)};
+    const std::uint64_t waits_before = cache.stats().waits;
+    auto follower = cache.acquire_deferred(follower_keys);
+    require(!follower.frames()[0].needs_upload &&
+                follower.frames()[1].needs_upload,
+            "deferred window did not retain a Loading hit and claim its miss");
+    require(cache.stats().waits == waits_before,
+            "deferred acquire blocked on a Loading hit");
+
+    auto future = std::async(std::launch::async, [&follower] {
+        follower.wait_hits(fake_stream(2));
+    });
+    const bool reached_wait =
+        eventually([&] { return cache.stats().waits > waits_before; });
+    const bool remained_blocked =
+        future.wait_for(20ms) == std::future_status::timeout;
+
+    owner.publish(fake_stream(1));
+    future.get();
+    require(reached_wait && remained_blocked,
+            "deferred hit was consumed before its producer published");
+    require(backend->wait_count() == 1,
+            "deferred hit did not enqueue its producer event wait");
+
+    follower.publish(fake_stream(2));
+    follower.release();
+    owner.release();
+}
+
+void test_deferred_loading_hit_reports_abandon() {
+    auto backend = std::make_shared<FakeBackend>();
+    vnlbcu::FrameCache cache(1, 64, backend);
+    const std::array requested{key(34)};
+    auto owner = cache.acquire(requested);
+    auto follower = cache.acquire_deferred(requested);
+
+    const std::uint64_t waits_before = cache.stats().waits;
+    auto future = std::async(std::launch::async, [&follower] {
+        follower.wait_hits(fake_stream(2));
+    });
+    require(eventually([&] { return cache.stats().waits > waits_before; }),
+            "deferred hit did not wait for its producer");
+
+    owner.abandon();
+    owner.release();
+    require_throws<std::runtime_error>([&] { future.get(); },
+                                       "deferred producer abandon");
+    follower.release();
+    require(cache.snapshot()[0].references == 0,
+            "abandoned deferred hit leaked a reference");
+}
+
 void test_no_partial_claim_while_waiting_for_victim() {
     auto backend = std::make_shared<FakeBackend>();
     vnlbcu::FrameCache cache(2, 64, backend);
@@ -577,6 +635,8 @@ int main() {
         test_lru_eviction();
         test_key_validation();
         test_loading_key_waits_for_publish();
+        test_deferred_loading_hit_waits_at_consumption();
+        test_deferred_loading_hit_reports_abandon();
         test_no_partial_claim_while_waiting_for_victim();
         test_abandon_and_raii_wake_waiters();
         test_record_failure_rolls_back_whole_window();

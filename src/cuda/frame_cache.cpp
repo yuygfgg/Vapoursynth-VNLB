@@ -164,7 +164,8 @@ class FrameCache::Impl {
 
     ~Impl() { destroy_slots(); }
 
-    ClaimResult claim(std::span<const FrameCacheKey> keys) {
+    ClaimResult claim(std::span<const FrameCacheKey> keys,
+                      bool defer_loading_hits) {
         validate_keys(keys, slots_.size());
         std::unique_lock lock(mutex_);
 
@@ -178,7 +179,8 @@ class FrameCache::Impl {
                 if (found == no_slot) {
                     continue;
                 }
-                if (slots_[found].state == FrameCacheSlotState::Loading) {
+                if (slots_[found].state == FrameCacheSlotState::Loading &&
+                    !defer_loading_hits) {
                     waits_for_loading_key = true;
                     break;
                 }
@@ -327,24 +329,16 @@ class FrameCache::Impl {
         condition_.notify_all();
     }
 
-    void wait_hits(const std::vector<std::size_t>& slots,
-                   const std::vector<bool>& loads, cudaStream_t stream) const {
-        // Event handles and slot storage are fixed for the cache lifetime.  A
-        // lease reference prevents reuse while these waits are enqueued.
-        for (std::size_t index = 0; index < slots.size(); ++index) {
-            if (!loads[index]) {
-                backend_->wait_event(stream, slots_[slots[index]].event);
-            }
-        }
+    void wait_hits(const std::vector<CachedDeviceFrame>& frames,
+                   const std::vector<std::size_t>& slots,
+                   const std::vector<bool>& loads, cudaStream_t stream) {
+        wait_selected(frames, slots, loads, false, stream);
     }
 
-    void wait_ready(const std::vector<std::size_t>& slots,
-                    cudaStream_t stream) const {
-        // Slots are fixed for the cache lifetime and the lease holds a
-        // reference, so event handles can be read without the state mutex.
-        for (const std::size_t slot : slots) {
-            backend_->wait_event(stream, slots_[slot].event);
-        }
+    void wait_ready(const std::vector<CachedDeviceFrame>& frames,
+                    const std::vector<std::size_t>& slots,
+                    const std::vector<bool>& loads, cudaStream_t stream) {
+        wait_selected(frames, slots, loads, true, stream);
     }
 
     void abandon(const std::vector<CachedDeviceFrame>& frames,
@@ -457,6 +451,54 @@ class FrameCache::Impl {
         return ++clock_;
     }
 
+    void wait_selected(const std::vector<CachedDeviceFrame>& frames,
+                       const std::vector<std::size_t>& slots,
+                       const std::vector<bool>& loads, bool include_loads,
+                       cudaStream_t stream) {
+        std::vector<FrameCacheBackend::Event> events;
+        events.reserve(slots.size());
+        {
+            std::unique_lock lock(mutex_);
+            const auto resolved = [&]() noexcept {
+                for (std::size_t index = 0; index < slots.size(); ++index) {
+                    if (!include_loads && loads[index]) {
+                        continue;
+                    }
+                    const Slot& slot = slots_[slots[index]];
+                    if (slot.state == FrameCacheSlotState::Loading &&
+                        slot.key.has_value() &&
+                        slot.key.value() == frames[index].key) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            if (!resolved()) {
+                ++stats_.waits;
+                condition_.wait(lock, resolved);
+            }
+
+            for (std::size_t index = 0; index < slots.size(); ++index) {
+                if (!include_loads && loads[index]) {
+                    continue;
+                }
+                const Slot& slot = slots_[slots[index]];
+                if (slot.state != FrameCacheSlotState::Ready ||
+                    !slot.key.has_value() ||
+                    slot.key.value() != frames[index].key) {
+                    throw std::runtime_error(
+                        "CUDA frame-cache producer abandoned a deferred hit");
+                }
+                events.push_back(slot.event);
+            }
+        }
+
+        // Lease references prevent reuse after the state lock is released.
+        for (const FrameCacheBackend::Event event : events) {
+            backend_->wait_event(stream, event);
+        }
+    }
+
     void abandon_locked(const std::vector<CachedDeviceFrame>& frames,
                         const std::vector<std::size_t>& slots,
                         const std::vector<bool>& loads) noexcept {
@@ -565,14 +607,14 @@ void FrameCache::Window::wait_ready(cudaStream_t stream) const {
         throw std::logic_error(
             "CUDA frame-cache window must be published before waiting");
     }
-    impl_->wait_ready(slots_, stream);
+    impl_->wait_ready(frames_, slots_, loads_, stream);
 }
 
 void FrameCache::Window::wait_hits(cudaStream_t stream) const {
     if (!valid()) {
         throw std::logic_error("CUDA frame-cache window is not valid");
     }
-    impl_->wait_hits(slots_, loads_, stream);
+    impl_->wait_hits(frames_, slots_, loads_, stream);
 }
 
 void FrameCache::Window::abandon() noexcept {
@@ -617,7 +659,18 @@ FrameCache::Window FrameCache::acquire(std::span<const FrameCacheKey> keys) {
         throw std::logic_error("CUDA FrameCache was moved from");
     }
     const std::shared_ptr<Impl> impl = impl_;
-    Impl::ClaimResult claim = impl->claim(keys);
+    Impl::ClaimResult claim = impl->claim(keys, false);
+    return Window(impl, std::move(claim.frames), std::move(claim.slots),
+                  std::move(claim.loads));
+}
+
+FrameCache::Window
+FrameCache::acquire_deferred(std::span<const FrameCacheKey> keys) {
+    if (impl_ == nullptr) {
+        throw std::logic_error("CUDA FrameCache was moved from");
+    }
+    const std::shared_ptr<Impl> impl = impl_;
+    Impl::ClaimResult claim = impl->claim(keys, true);
     return Window(impl, std::move(claim.frames), std::move(claim.slots),
                   std::move(claim.loads));
 }

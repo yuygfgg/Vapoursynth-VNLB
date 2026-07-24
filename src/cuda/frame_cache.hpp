@@ -70,9 +70,9 @@ struct CachedDeviceFrame {
     bool needs_upload = false;
 };
 
-// Fixed-capacity, refcounted device frame cache.  acquire() reserves an entire
-// window atomically: a waiter never holds a partial set of slots, so two
-// overlapping windows cannot deadlock while each waits for the other's
+// Fixed-capacity, refcounted device frame cache.  Window acquisition reserves
+// an entire window atomically: a waiter never holds a partial set of slots, so
+// two overlapping windows cannot deadlock while each waits for the other's
 // remaining slots.  A loading window must be published or abandoned; the RAII
 // lease abandons unpublished slots automatically on error.
 //
@@ -101,17 +101,18 @@ class FrameCache final {
         [[nodiscard]] bool published() const noexcept;
 
         // Record every missing slot's ready event on stream, then publish all
-        // of them under one cache lock.  No slot becomes acquirable in Loading
-        // state.  If event recording throws, the window remains unpublished
-        // and must be abandoned after any work writing those slots is done.
+        // of them under one cache lock.  Ordinary acquire() cannot observe a
+        // Loading slot; acquire_deferred() may retain it but cannot consume it
+        // before this transition.  If event recording throws, the window
+        // remains unpublished and must be abandoned after any work writing
+        // those slots is done.
         void publish(cudaStream_t stream);
 
-        // Enqueue waits only for entries which were Ready when this window was
-        // acquired.  Missing entries belong exclusively to this lease and can
-        // therefore be written and consumed on the same stream before they are
-        // published.  This supports a single final status synchronization:
-        // wait for hits, produce/consume misses, check asynchronous status,
-        // then publish on success or abandon on failure.
+        // Wait for deferred hit producers to publish, then enqueue their ready
+        // event waits.  Missing entries belong exclusively to this lease and
+        // are skipped.  A deferred caller can enqueue its miss production
+        // before calling this method, preserving producer concurrency while
+        // retaining publish/abandon error propagation.
         void wait_hits(cudaStream_t stream) const;
 
         // Enqueue waits for every frame's recorded ready event.  This is valid
@@ -157,6 +158,14 @@ class FrameCache final {
     // Blocks until every key can be claimed together.  Keys must be unique,
     // non-negative frame indices and the window may not exceed slot_count().
     [[nodiscard]] Window acquire(std::span<const FrameCacheKey> keys);
+
+    // Like acquire(), but matching Loading keys are retained as deferred hits
+    // instead of blocking this call.  The caller may enqueue work for its own
+    // misses first, then call Window::wait_hits() before consuming any hits.
+    // wait_hits() blocks until the original producers publish, or throws if a
+    // producer abandons its key.  This keeps overlapping CUDA producers busy
+    // without exposing incomplete device data.
+    [[nodiscard]] Window acquire_deferred(std::span<const FrameCacheKey> keys);
 
     [[nodiscard]] std::size_t slot_count() const noexcept;
     [[nodiscard]] std::size_t frame_bytes() const noexcept;

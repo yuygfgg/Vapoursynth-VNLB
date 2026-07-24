@@ -1697,9 +1697,8 @@ void copy_output_to_frame(const Worker& worker, VSFrame* output,
             data->parameters, data->geometry, output_frame);
         build_contiguous_keys(worker.contribution_keys,
                               data->contribution_source_id, anchors);
-        contribution_window =
-            data->contribution_cache->acquire(worker.contribution_keys);
-        contribution_window.wait_hits(worker.stream_);
+        contribution_window = data->contribution_cache->acquire_deferred(
+            worker.contribution_keys);
 
         int missing_count = 0;
         FrameRange assembly_range{data->vi.numFrames, -1};
@@ -1814,6 +1813,10 @@ void copy_output_to_frame(const Worker& worker, VSFrame* output,
             .row_stride = data->vi.width,
             .channel_stride = data->geometry.plane_values,
         };
+        // Deferred hits may still be produced by another worker.  All work for
+        // this window's misses is already queued, so waiting here preserves
+        // solver error propagation without serializing contribution producers.
+        contribution_window.wait_hits(worker.stream_);
         worker.normalizer_.enqueue_normalize_many(
             worker.contribution_sources_.data(), source_index, fallback_view,
             output_frame, output_view, worker.stream_);
